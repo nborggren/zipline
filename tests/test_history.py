@@ -22,151 +22,35 @@ from nose_parameterized import parameterized
 import numpy as np
 import pandas as pd
 from pandas.util.testing import assert_frame_equal
-
-from zipline.history import history
-from zipline.history.history_container import HistoryContainer
-from zipline.protocol import BarData
-import zipline.utils.factory as factory
-from zipline import TradingAlgorithm
-from zipline.finance.trading import (
-    SimulationParameters,
-    TradingEnvironment,
-    with_environment,
-)
-from zipline.errors import IncompatibleHistoryFrequency
-
-from zipline.sources import RandomWalkSource, DataFrameSource
+from pandas.tseries.tools import normalize_date
 
 from .history_cases import (
     HISTORY_CONTAINER_TEST_CASES,
 )
-
-# Cases are over the July 4th holiday, to ensure use of trading calendar.
-
-#      March 2013
-# Su Mo Tu We Th Fr Sa
-#                 1  2
-#  3  4  5  6  7  8  9
-# 10 11 12 13 14 15 16
-# 17 18 19 20 21 22 23
-# 24 25 26 27 28 29 30
-# 31
-#      April 2013
-# Su Mo Tu We Th Fr Sa
-#     1  2  3  4  5  6
-#  7  8  9 10 11 12 13
-# 14 15 16 17 18 19 20
-# 21 22 23 24 25 26 27
-# 28 29 30
-#
-#       May 2013
-# Su Mo Tu We Th Fr Sa
-#           1  2  3  4
-#  5  6  7  8  9 10 11
-# 12 13 14 15 16 17 18
-# 19 20 21 22 23 24 25
-# 26 27 28 29 30 31
-#
-#      June 2013
-# Su Mo Tu We Th Fr Sa
-#                    1
-#  2  3  4  5  6  7  8
-#  9 10 11 12 13 14 15
-# 16 17 18 19 20 21 22
-# 23 24 25 26 27 28 29
-# 30
-#      July 2013
-# Su Mo Tu We Th Fr Sa
-#     1  2  3  4  5  6
-#  7  8  9 10 11 12 13
-# 14 15 16 17 18 19 20
-# 21 22 23 24 25 26 27
-# 28 29 30 31
-#
-# Times to be converted via:
-# pd.Timestamp('2013-07-05 9:31', tz='US/Eastern').tz_convert('UTC')},
-
-INDEX_TEST_CASES_RAW = {
-    'week of daily data': {
-        'input': {'bar_count': 5,
-                  'frequency': '1d',
-                  'algo_dt': '2013-07-05 9:31AM'},
-        'expected': [
-            '2013-06-28 4:00PM',
-            '2013-07-01 4:00PM',
-            '2013-07-02 4:00PM',
-            '2013-07-03 1:00PM',
-            '2013-07-05 9:31AM',
-        ]
-    },
-    'five minutes on july 5th open': {
-        'input': {'bar_count': 5,
-                  'frequency': '1m',
-                  'algo_dt': '2013-07-05 9:31AM'},
-        'expected': [
-            '2013-07-03 12:57PM',
-            '2013-07-03 12:58PM',
-            '2013-07-03 12:59PM',
-            '2013-07-03 1:00PM',
-            '2013-07-05 9:31AM',
-        ]
-    },
-}
-
-
-def to_timestamp(dt_str):
-    return pd.Timestamp(dt_str, tz='US/Eastern').tz_convert('UTC')
-
-
-def convert_cases(cases):
-    """
-    Convert raw strings to values comparable with system data.
-    """
-    cases = cases.copy()
-    for case in cases.values():
-        case['input']['algo_dt'] = to_timestamp(case['input']['algo_dt'])
-        case['expected'] = pd.DatetimeIndex([to_timestamp(dt_str) for dt_str
-                                             in case['expected']])
-    return cases
-
-INDEX_TEST_CASES = convert_cases(INDEX_TEST_CASES_RAW)
-
-
-def get_index_at_dt(case_input):
-    history_spec = history.HistorySpec(
-        case_input['bar_count'],
-        case_input['frequency'],
-        None,
-        False,
-        data_frequency='minute',
-    )
-    return history.index_at_dt(history_spec, case_input['algo_dt'])
-
-
-class TestHistoryIndex(TestCase):
-
-    @classmethod
-    def setUpClass(cls):
-        cls.environment = TradingEnvironment.instance()
-
-    @parameterized.expand(
-        [(name, case['input'], case['expected'])
-         for name, case in INDEX_TEST_CASES.items()]
-    )
-    def test_index_at_dt(self, name, case_input, expected):
-        history_index = get_index_at_dt(case_input)
-
-        history_series = pd.Series(index=history_index)
-        expected_series = pd.Series(index=expected)
-
-        pd.util.testing.assert_series_equal(history_series, expected_series)
+from zipline import TradingAlgorithm
+from zipline.errors import HistoryInInitialize, IncompatibleHistoryFrequency
+from zipline.finance import trading
+from zipline.finance.trading import (
+    SimulationParameters,
+    TradingEnvironment,
+)
+from zipline.history import history
+from zipline.history.history_container import HistoryContainer
+from zipline.protocol import BarData
+from zipline.sources import RandomWalkSource, DataFrameSource
+import zipline.utils.factory as factory
+from zipline.utils.test_utils import subtest
 
 
 class TestHistoryContainer(TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.env = TradingEnvironment.instance()
+        cls.env = TradingEnvironment()
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.env
 
     def bar_data_dt(self, bar_data, require_unique=True):
         """
@@ -204,6 +88,7 @@ class TestHistoryContainer(TestCase):
 
         container = HistoryContainer(
             {spec.key_str: spec for spec in specs}, sids, dt, 'minute',
+            env=self.env,
         )
 
         for update_count, update in enumerate(updates):
@@ -231,14 +116,16 @@ class TestHistoryContainer(TestCase):
             frequency='1m',
             field='price',
             ffill=True,
-            data_frequency='minute'
+            data_frequency='minute',
+            env=self.env,
         )
         no_fill_spec = history.HistorySpec(
             bar_count=3,
             frequency='1m',
             field='price',
             ffill=False,
-            data_frequency='minute'
+            data_frequency='minute',
+            env=self.env,
         )
 
         specs = {spec.key_str: spec, no_fill_spec.key_str: no_fill_spec}
@@ -247,7 +134,7 @@ class TestHistoryContainer(TestCase):
             '2013-06-28 9:31AM', tz='US/Eastern').tz_convert('UTC')
 
         container = HistoryContainer(
-            specs, initial_sids, initial_dt, 'minute'
+            specs, initial_sids, initial_dt, 'minute', env=self.env,
         )
 
         bar_data = BarData()
@@ -281,7 +168,8 @@ class TestHistoryContainer(TestCase):
             frequency='1d',
             field='price',
             ffill=True,
-            data_frequency='minute'
+            data_frequency='minute',
+            env=self.env,
         )
         specs = {spec.key_str: spec}
         initial_sids = [1, ]
@@ -289,7 +177,7 @@ class TestHistoryContainer(TestCase):
             '2013-06-28 9:31AM', tz='US/Eastern').tz_convert('UTC')
 
         container = HistoryContainer(
-            specs, initial_sids, initial_dt, 'minute'
+            specs, initial_sids, initial_dt, 'minute', env=self.env,
         )
 
         bar_data = BarData()
@@ -404,6 +292,16 @@ class TestHistoryContainer(TestCase):
 
 
 class TestHistoryAlgo(TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.env = trading.TradingEnvironment()
+        cls.env.write_data(equities_identifiers=[0, 1])
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.env
+
     def setUp(self):
         np.random.seed(123)
 
@@ -433,24 +331,26 @@ def handle_data(context, data):
         end = pd.Timestamp('2006-03-30', tz='UTC')
 
         sim_params = factory.create_simulation_parameters(
-            start=start, end=end, data_frequency='daily')
+            start=start, end=end, data_frequency='daily', env=self.env,
+        )
 
-        _, df = factory.create_test_df_source(sim_params)
+        _, df = factory.create_test_df_source(sim_params, self.env)
         df = df.astype(np.float64)
         source = DataFrameSource(df)
 
         test_algo = TradingAlgorithm(
             script=algo_text,
             data_frequency='daily',
-            sim_params=sim_params
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
         )
 
         output = test_algo.run(source)
         self.assertIsNotNone(output)
 
-        history_trace = test_algo.history_trace
+        df.columns = self.env.asset_finder.retrieve_all(df.columns)
 
-        for i, received in enumerate(history_trace[bar_count - 1:]):
+        for i, received in enumerate(test_algo.history_trace[bar_count - 1:]):
             expected = df.iloc[i:i + bar_count]
             assert_frame_equal(expected, received)
 
@@ -475,7 +375,8 @@ def handle_data(context, data):
             algo = TradingAlgorithm(
                 script=algo_text,
                 data_frequency='daily',
-                sim_params=sim_params
+                sim_params=sim_params,
+                env=TestHistoryAlgo.env,
             )
             source = RandomWalkSource(start=start, end=end)
             algo.run(source)
@@ -510,7 +411,7 @@ def handle_data(context, data):
             script=algo_text,
             data_frequency='minute',
             sim_params=sim_params,
-            identifiers=[0]
+            env=TestHistoryAlgo.env,
         )
 
         source = RandomWalkSource(start=start,
@@ -530,6 +431,310 @@ def handle_data(context, data):
         # Random, depends on seed
         self.assertEquals(139.36946942498648, last_prices[oldest_dt])
         self.assertEquals(180.15661995395106, last_prices[newest_dt])
+
+    @parameterized.expand([
+        ('daily',),
+        ('minute',),
+    ])
+    def test_history_in_bts_price_days(self, data_freq):
+        """
+        Test calling history() in before_trading_start()
+        with daily price bars.
+        """
+        algo_text = """
+from zipline.api import history
+
+def initialize(context):
+    context.first_bts_call = True
+
+def before_trading_start(context, data):
+    if not context.first_bts_call:
+        prices_bts = history(bar_count=3, frequency='1d', field='price')
+        context.prices_bts = prices_bts
+    context.first_bts_call = False
+
+def handle_data(context, data):
+    prices_hd = history(bar_count=3, frequency='1d', field='price')
+    context.prices_hd = prices_hd
+""".strip()
+
+        #      March 2006
+        # Su Mo Tu We Th Fr Sa
+        #          1  2  3  4
+        #  5  6  7  8  9 10 11
+        # 12 13 14 15 16 17 18
+        # 19 20 21 22 23 24 25
+        # 26 27 28 29 30 31
+        start = pd.Timestamp('2006-03-20', tz='UTC')
+        end = pd.Timestamp('2006-03-22', tz='UTC')
+
+        sim_params = factory.create_simulation_parameters(
+            start=start, end=end, data_frequency=data_freq)
+
+        test_algo = TradingAlgorithm(
+            script=algo_text,
+            data_frequency=data_freq,
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
+        )
+
+        source = RandomWalkSource(start=start, end=end, freq=data_freq)
+        output = test_algo.run(source)
+        self.assertIsNotNone(output)
+
+        # Get the prices recorded by history() within handle_data()
+        prices_hd = test_algo.prices_hd[0]
+        # Get the prices recorded by history() within BTS
+        prices_bts = test_algo.prices_bts[0]
+
+        # before_trading_start() is timestamp'd to midnight prior to
+        # the day's trading. Since no equity trades occur at midnight,
+        # the price recorded for this time is forward filled from the
+        # last trade - typically ~4pm the previous day. This results
+        # in the OHLCV data recorded by history() in BTS lagging
+        # that recorded by history in handle_data().
+        # The trace of the pricing data from history() called within
+        # handle_data() vs. BTS in the above algo is as follows:
+
+        #  When called within handle_data()
+        # ---------------------------------
+        # 2006-03-20 21:00:00    139.369469
+        # 2006-03-21 21:00:00    180.156620
+        # 2006-03-22 21:00:00    221.344654
+
+        #       When called within BTS
+        # ---------------------------------
+        # 2006-03-17 21:00:00           NaN
+        # 2006-03-20 21:00:00    139.369469
+        # 2006-03-22 00:00:00    180.156620
+
+        # Get relevant Timestamps for the history() call within handle_data()
+        oldest_hd_dt = pd.Timestamp(
+            '2006-03-20 4:00 PM', tz='US/Eastern').tz_convert('UTC')
+        penultimate_hd_dt = pd.Timestamp(
+            '2006-03-21 4:00 PM', tz='US/Eastern').tz_convert('UTC')
+
+        # Get relevant Timestamps for the history() call within BTS
+        penultimate_bts_dt = pd.Timestamp(
+            '2006-03-20 4:00 PM', tz='US/Eastern').tz_convert('UTC')
+        newest_bts_dt = normalize_date(pd.Timestamp(
+            '2006-03-22 04:00 PM', tz='US/Eastern').tz_convert('UTC'))
+
+        if data_freq == 'daily':
+            # If we're dealing with daily data, then we record
+            # canonicalized timestamps, so make conversion here:
+            oldest_hd_dt = normalize_date(oldest_hd_dt)
+            penultimate_hd_dt = normalize_date(penultimate_hd_dt)
+            penultimate_bts_dt = normalize_date(penultimate_bts_dt)
+
+        self.assertEquals(prices_hd[oldest_hd_dt],
+                          prices_bts[penultimate_bts_dt])
+        self.assertEquals(prices_hd[penultimate_hd_dt],
+                          prices_bts[newest_bts_dt])
+
+    def test_history_in_bts_price_minutes(self):
+        """
+        Test calling history() in before_trading_start()
+        with minutely price bars.
+        """
+        algo_text = """
+from zipline.api import history
+
+def initialize(context):
+    context.first_bts_call = True
+
+def before_trading_start(context, data):
+    if not context.first_bts_call:
+        price_bts = history(bar_count=1, frequency='1m', field='price')
+        context.price_bts = price_bts
+    context.first_bts_call = False
+
+def handle_data(context, data):
+    pass
+
+""".strip()
+
+        #      March 2006
+        # Su Mo Tu We Th Fr Sa
+        #          1  2  3  4
+        #  5  6  7  8  9 10 11
+        # 12 13 14 15 16 17 18
+        # 19 20 21 22 23 24 25
+        # 26 27 28 29 30 31
+        start = pd.Timestamp('2006-03-20', tz='UTC')
+        end = pd.Timestamp('2006-03-22', tz='UTC')
+
+        sim_params = factory.create_simulation_parameters(
+            start=start, end=end)
+
+        test_algo = TradingAlgorithm(
+            script=algo_text,
+            data_frequency='minute',
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
+        )
+
+        source = RandomWalkSource(start=start, end=end)
+        output = test_algo.run(source)
+        self.assertIsNotNone(output)
+
+        # Get the prices recorded by history() within BTS
+        price_bts_0 = test_algo.price_bts[0]
+        price_bts_1 = test_algo.price_bts[1]
+
+        # The prices recorded by history() in BTS should
+        # be the closing price of the previous day, which are:
+        #
+        #          sid | close on 2006-03-21
+        #         ----------------------------
+        #           0  | 180.15661995395106
+        #           1  | 578.41665003444723
+
+        # These are not 'real' price values. They are the product of
+        # RandonWalkSource, which produces random walk OHLCV timeseries. For a
+        # given seed these values are deterministc.
+        self.assertEquals(180.15661995395106, price_bts_0.ix[0])
+        self.assertEquals(578.41665003444723, price_bts_1.ix[0])
+
+    @parameterized.expand([
+        ('daily',),
+        ('minute',),
+    ])
+    def test_history_in_bts_volume_days(self, data_freq):
+        """
+        Test calling history() in before_trading_start()
+        with daily volume bars.
+        """
+        algo_text = """
+from zipline.api import history
+
+def initialize(context):
+    context.first_bts_call = True
+
+def before_trading_start(context, data):
+    if not context.first_bts_call:
+        volume_bts = history(bar_count=2, frequency='1d', field='volume')
+        context.volume_bts = volume_bts
+    context.first_bts_call = False
+
+def handle_data(context, data):
+    volume_hd = history(bar_count=2, frequency='1d', field='volume')
+    context.volume_hd = volume_hd
+""".strip()
+
+        #      March 2006
+        # Su Mo Tu We Th Fr Sa
+        #          1  2  3  4
+        #  5  6  7  8  9 10 11
+        # 12 13 14 15 16 17 18
+        # 19 20 21 22 23 24 25
+        # 26 27 28 29 30 31
+        start = pd.Timestamp('2006-03-20', tz='UTC')
+        end = pd.Timestamp('2006-03-22', tz='UTC')
+
+        sim_params = factory.create_simulation_parameters(
+            start=start, end=end, data_frequency=data_freq)
+
+        test_algo = TradingAlgorithm(
+            script=algo_text,
+            data_frequency=data_freq,
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
+        )
+
+        source = RandomWalkSource(start=start, end=end, freq=data_freq)
+        output = test_algo.run(source)
+        self.assertIsNotNone(output)
+
+        # Get the volume recorded by history() within handle_data()
+        volume_hd_0 = test_algo.volume_hd[0]
+        volume_hd_1 = test_algo.volume_hd[1]
+        # Get the volume recorded by history() within BTS
+        volume_bts_0 = test_algo.volume_bts[0]
+        volume_bts_1 = test_algo.volume_bts[1]
+
+        penultimate_hd_dt = pd.Timestamp(
+            '2006-03-21 4:00 PM', tz='US/Eastern').tz_convert('UTC')
+        # Midnight of the day on which BTS is invoked.
+        newest_bts_dt = normalize_date(pd.Timestamp(
+            '2006-03-22 04:00 PM', tz='US/Eastern').tz_convert('UTC'))
+
+        if data_freq == 'daily':
+            # If we're dealing with daily data, then we record
+            # canonicalized timestamps, so make conversion here:
+            penultimate_hd_dt = normalize_date(penultimate_hd_dt)
+
+        # When history() is called in BTS, its 'current' volume value
+        # should equal the sum of the previous day.
+        self.assertEquals(volume_hd_0[penultimate_hd_dt],
+                          volume_bts_0[newest_bts_dt])
+        self.assertEquals(volume_hd_1[penultimate_hd_dt],
+                          volume_bts_1[newest_bts_dt])
+
+    def test_history_in_bts_volume_minutes(self):
+        """
+        Test calling history() in before_trading_start()
+        with minutely volume bars.
+        """
+        algo_text = """
+from zipline.api import history
+
+def initialize(context):
+    context.first_bts_call = True
+
+def before_trading_start(context, data):
+    if not context.first_bts_call:
+        volume_bts = history(bar_count=2, frequency='1m', field='volume')
+        context.volume_bts = volume_bts
+    context.first_bts_call = False
+
+def handle_data(context, data):
+    pass
+""".strip()
+
+        #      March 2006
+        # Su Mo Tu We Th Fr Sa
+        #          1  2  3  4
+        #  5  6  7  8  9 10 11
+        # 12 13 14 15 16 17 18
+        # 19 20 21 22 23 24 25
+        # 26 27 28 29 30 31
+        start = pd.Timestamp('2006-03-20', tz='UTC')
+        end = pd.Timestamp('2006-03-22', tz='UTC')
+
+        sim_params = factory.create_simulation_parameters(
+            start=start, end=end)
+
+        test_algo = TradingAlgorithm(
+            script=algo_text,
+            data_frequency='minute',
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
+        )
+
+        source = RandomWalkSource(start=start, end=end)
+        output = test_algo.run(source)
+        self.assertIsNotNone(output)
+
+        # Get the volumes recorded for sid 0 by history() within BTS
+        volume_bts_0 = test_algo.volume_bts[0]
+        # Get the volumes recorded for sid 1 by history() within BTS
+        volume_bts_1 = test_algo.volume_bts[1]
+
+        # The values recorded on 2006-03-22 by history() in BTS
+        # should equal the final volume values for the trading
+        # day 2006-03-21:
+        #                             0       1
+        #   2006-03-21 20:59:00  215548  439908
+        #   2006-03-21 21:00:00  985645  664313
+        #
+        # Note: These are not 'real' volume values. They are the product of
+        # RandonWalkSource, which produces random walk OHLCV timeseries. For a
+        # given seed these values are deterministc.
+        self.assertEquals(215548, volume_bts_0.ix[0])
+        self.assertEquals(985645, volume_bts_0.ix[1])
+        self.assertEquals(439908, volume_bts_1.ix[0])
+        self.assertEquals(664313, volume_bts_1.ix[1])
 
     def test_basic_history_one_day(self):
         algo_text = """
@@ -560,7 +765,8 @@ def handle_data(context, data):
         test_algo = TradingAlgorithm(
             script=algo_text,
             data_frequency='minute',
-            sim_params=sim_params
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
         )
 
         source = RandomWalkSource(start=start,
@@ -616,7 +822,8 @@ def handle_data(context, data):
         test_algo = TradingAlgorithm(
             script=algo_text,
             data_frequency='minute',
-            sim_params=sim_params
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
         )
 
         source = RandomWalkSource(start=start,
@@ -671,7 +878,8 @@ def handle_data(context, data):
         test_algo = TradingAlgorithm(
             script=algo_text,
             data_frequency='minute',
-            sim_params=sim_params
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
         )
 
         source = RandomWalkSource(start=start,
@@ -716,7 +924,8 @@ def handle_data(context, data):
         test_algo = TradingAlgorithm(
             script=algo_text,
             data_frequency='minute',
-            sim_params=sim_params
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
         )
 
         source = RandomWalkSource(start=start,
@@ -761,7 +970,8 @@ def handle_data(context, data):
         test_algo = TradingAlgorithm(
             script=algo_text,
             data_frequency='minute',
-            sim_params=sim_params
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
         )
 
         source = RandomWalkSource(start=start,
@@ -806,7 +1016,8 @@ def handle_data(context, data):
         test_algo = TradingAlgorithm(
             script=algo_text,
             data_frequency='minute',
-            sim_params=sim_params
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
         )
 
         source = RandomWalkSource(start=start,
@@ -856,7 +1067,8 @@ def handle_data(context, data):
         test_algo = TradingAlgorithm(
             script=algo_text,
             data_frequency='minute',
-            sim_params=sim_params
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
         )
 
         source = RandomWalkSource(start=start,
@@ -915,7 +1127,8 @@ def handle_data(context, data):
         test_algo = TradingAlgorithm(
             script=algo_text,
             data_frequency='minute',
-            sim_params=sim_params
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
         )
 
         source = RandomWalkSource(start=start,
@@ -957,7 +1170,8 @@ def handle_data(context, data):
         test_algo = TradingAlgorithm(
             script=algo_text,
             data_frequency=data_freq,
-            sim_params=sim_params
+            sim_params=sim_params,
+            env=TestHistoryAlgo.env,
         )
 
         source = RandomWalkSource(start=start, end=end, freq=data_freq)
@@ -988,6 +1202,41 @@ def handle_data(context, data):
             msg='The digest panel is not large enough to service the given'
             ' HistorySpec',
         )
+
+    def test_history_in_initialize(self):
+        algo_text = dedent(
+            """\
+            from zipline.api import history
+
+            def initialize(context):
+                history(10, '1d', 'price')
+
+            def handle_data(context, data):
+                pass
+            """
+        )
+
+        start = pd.Timestamp('2007-04-05', tz='UTC')
+        end = pd.Timestamp('2007-04-10', tz='UTC')
+
+        sim_params = SimulationParameters(
+            period_start=start,
+            period_end=end,
+            capital_base=float("1.0e5"),
+            data_frequency='minute',
+            emission_rate='daily',
+            env=self.env,
+        )
+
+        test_algo = TradingAlgorithm(
+            script=algo_text,
+            data_frequency='minute',
+            sim_params=sim_params,
+            env=self.env,
+        )
+
+        with self.assertRaises(HistoryInInitialize):
+            test_algo.initialize()
 
     @parameterized.expand([
         (1,),
@@ -1021,13 +1270,15 @@ def handle_data(context, data):
             period_end=end,
             capital_base=float("1.0e5"),
             data_frequency='minute',
-            emission_rate='daily'
+            emission_rate='daily',
+            env=self.env,
         )
 
         test_algo = TradingAlgorithm(
             script=algo_text,
             data_frequency='minute',
-            sim_params=sim_params
+            sim_params=sim_params,
+            env=self.env,
         )
         test_algo.test_case = self
 
@@ -1070,13 +1321,15 @@ def handle_data(context, data):
             period_end=end,
             capital_base=float("1.0e5"),
             data_frequency='minute',
-            emission_rate='daily'
+            emission_rate='daily',
+            env=self.env,
         )
 
         test_algo = TradingAlgorithm(
             script=algo_text,
             data_frequency='minute',
-            sim_params=sim_params
+            sim_params=sim_params,
+            env=self.env,
         )
         test_algo.test_case = self
 
@@ -1087,13 +1340,26 @@ def handle_data(context, data):
 
 
 class TestHistoryContainerResize(TestCase):
-    @parameterized.expand(
-        (freq, field, data_frequency, construct_digest)
-        for freq in ('1m', '1d')
-        for field in HistoryContainer.VALID_FIELDS
-        for data_frequency in ('minute', 'daily')
-        for construct_digest in (True, False)
-        if not (freq == '1m' and data_frequency == 'daily')
+
+    @classmethod
+    def setUpClass(cls):
+        cls.env = TradingEnvironment()
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.env
+
+    @subtest(
+        ((freq, field, data_frequency, construct_digest)
+         for freq in ('1m', '1d')
+         for field in HistoryContainer.VALID_FIELDS
+         for data_frequency in ('minute', 'daily')
+         for construct_digest in (True, False)
+         if not (freq == '1m' and data_frequency == 'daily')),
+        'freq',
+        'field',
+        'data_frequency',
+        'construct_digest',
     )
     def test_history_grow_length(self,
                                  freq,
@@ -1107,6 +1373,7 @@ class TestHistoryContainerResize(TestCase):
             field=field,
             ffill=True,
             data_frequency=data_frequency,
+            env=self.env,
         )
         specs = {spec.key_str: spec}
         initial_sids = [1]
@@ -1118,7 +1385,7 @@ class TestHistoryContainerResize(TestCase):
         )
 
         container = HistoryContainer(
-            specs, initial_sids, initial_dt, data_frequency,
+            specs, initial_sids, initial_dt, data_frequency, env=self.env,
         )
 
         if construct_digest:
@@ -1136,6 +1403,7 @@ class TestHistoryContainerResize(TestCase):
                 field=field,
                 ffill=True,
                 data_frequency=data_frequency,
+                env=self.env,
             ),
             history.HistorySpec(
                 bar_count=bar_count + 2,
@@ -1143,6 +1411,7 @@ class TestHistoryContainerResize(TestCase):
                 field=field,
                 ffill=True,
                 data_frequency=data_frequency,
+                env=self.env,
             ),
         )
 
@@ -1156,13 +1425,17 @@ class TestHistoryContainerResize(TestCase):
 
             self.assert_history(container, spec, initial_dt)
 
-    @parameterized.expand(
-        (bar_count, freq, pair, data_frequency)
-        for bar_count in (1, 2)
-        for freq in ('1m', '1d')
-        for pair in product(HistoryContainer.VALID_FIELDS, repeat=2)
-        for data_frequency in ('minute', 'daily')
-        if not (freq == '1m' and data_frequency == 'daily')
+    @subtest(
+        ((bar_count, freq, pair, data_frequency)
+         for bar_count in (1, 2)
+         for freq in ('1m', '1d')
+         for pair in product(HistoryContainer.VALID_FIELDS, repeat=2)
+         for data_frequency in ('minute', 'daily')
+         if not (freq == '1m' and data_frequency == 'daily')),
+        'bar_count',
+        'freq',
+        'pair',
+        'data_frequency',
     )
     def test_history_add_field(self, bar_count, freq, pair, data_frequency):
         first, second = pair
@@ -1172,6 +1445,7 @@ class TestHistoryContainerResize(TestCase):
             field=first,
             ffill=True,
             data_frequency=data_frequency,
+            env=self.env,
         )
         specs = {spec.key_str: spec}
         initial_sids = [1]
@@ -1183,7 +1457,7 @@ class TestHistoryContainerResize(TestCase):
         )
 
         container = HistoryContainer(
-            specs, initial_sids, initial_dt, data_frequency,
+            specs, initial_sids, initial_dt, data_frequency, env=self.env
         )
 
         if bar_count > 1:
@@ -1200,6 +1474,7 @@ class TestHistoryContainerResize(TestCase):
             field=second,
             ffill=True,
             data_frequency=data_frequency,
+            env=self.env,
         )
 
         container.ensure_spec(new_spec, initial_dt, bar_data)
@@ -1216,13 +1491,17 @@ class TestHistoryContainerResize(TestCase):
 
             self.assert_history(container, new_spec, initial_dt)
 
-    @parameterized.expand(
-        (bar_count, pair, field, data_frequency)
-        for bar_count in (1, 2)
-        for pair in product(('1m', '1d'), repeat=2)
-        for field in HistoryContainer.VALID_FIELDS
-        for data_frequency in ('minute', 'daily')
-        if not ('1m' in pair and data_frequency == 'daily')
+    @subtest(
+        ((bar_count, pair, field, data_frequency)
+         for bar_count in (1, 2)
+         for pair in product(('1m', '1d'), repeat=2)
+         for field in HistoryContainer.VALID_FIELDS
+         for data_frequency in ('minute', 'daily')
+         if not ('1m' in pair and data_frequency == 'daily')),
+        'bar_count',
+        'pair',
+        'field',
+        'data_frequency',
     )
     def test_history_add_freq(self, bar_count, pair, field, data_frequency):
         first, second = pair
@@ -1232,6 +1511,7 @@ class TestHistoryContainerResize(TestCase):
             field=field,
             ffill=True,
             data_frequency=data_frequency,
+            env=self.env,
         )
         specs = {spec.key_str: spec}
         initial_sids = [1]
@@ -1243,7 +1523,7 @@ class TestHistoryContainerResize(TestCase):
         )
 
         container = HistoryContainer(
-            specs, initial_sids, initial_dt, data_frequency,
+            specs, initial_sids, initial_dt, data_frequency, env=self.env,
         )
 
         if bar_count > 1:
@@ -1260,6 +1540,7 @@ class TestHistoryContainerResize(TestCase):
             field=field,
             ffill=True,
             data_frequency=data_frequency,
+            env=self.env,
         )
 
         container.ensure_spec(new_spec, initial_dt, bar_data)
@@ -1272,8 +1553,7 @@ class TestHistoryContainerResize(TestCase):
 
         self.assert_history(container, new_spec, initial_dt)
 
-    @with_environment()
-    def assert_history(self, container, spec, dt, env=None):
+    def assert_history(self, container, spec, dt):
         hst = container.get_history(spec, dt)
 
         self.assertEqual(len(hst), spec.bar_count)

@@ -17,11 +17,14 @@ import warnings
 
 import pytz
 import pandas as pd
+from pandas.tseries.tools import normalize_date
 import numpy as np
 
 from datetime import datetime
+from itertools import groupby, chain, repeat
+from numbers import Integral
+from operator import attrgetter
 
-from itertools import groupby, chain
 from six.moves import filter
 from six import (
     exec_,
@@ -29,16 +32,20 @@ from six import (
     itervalues,
     string_types,
 )
-from operator import attrgetter
+
 
 from zipline.errors import (
-    AddTermPostInit,
+    AttachPipelineAfterInitialize,
+    HistoryInInitialize,
+    NoSuchPipeline,
     OrderDuringInitialize,
-    OverrideCommissionPostInit,
-    OverrideSlippagePostInit,
+    PipelineOutputDuringInitialize,
     RegisterAccountControlPostInit,
     RegisterTradingControlPostInit,
+    SetCommissionPostInit,
+    SetSlippagePostInit,
     UnsupportedCommissionModel,
+    UnsupportedDatetimeFormat,
     UnsupportedOrderParameters,
     UnsupportedSlippageModel,
 )
@@ -69,16 +76,19 @@ from zipline.assets import Asset, Future
 from zipline.assets.futures import FutureChain
 from zipline.gens.composites import date_sorted_sources
 from zipline.gens.tradesimulation import AlgorithmSimulator
-from zipline.modelling.engine import (
-    NoOpFFCEngine,
-    SimpleFFCEngine,
+from zipline.pipeline.engine import (
+    NoOpPipelineEngine,
+    SimplePipelineEngine,
 )
 from zipline.sources import DataFrameSource, DataPanelSource
 from zipline.utils.api_support import (
     api_method,
+    require_initialized,
     require_not_initialized,
     ZiplineAPI,
 )
+from zipline.utils.input_validation import ensure_upper_case
+from zipline.utils.cache import CachedObject, Expired
 import zipline.utils.events
 from zipline.utils.events import (
     EventManager,
@@ -88,6 +98,7 @@ from zipline.utils.events import (
 )
 from zipline.utils.factory import create_simulation_parameters
 from zipline.utils.math_utils import tolerant_equals
+from zipline.utils.preprocess import preprocess
 
 import zipline.protocol
 from zipline.protocol import Event
@@ -146,7 +157,7 @@ class TradingAlgorithm(object):
                Whether to fill orders immediately or on next bar.
             asset_finder : An AssetFinder object
                 A new AssetFinder object to be used in this TradingEnvironment
-            asset_metadata: can be either:
+            equities_metadata : can be either:
                             - dict
                             - pandas.DataFrame
                             - object with 'read' property
@@ -164,7 +175,7 @@ class TradingAlgorithm(object):
                 with the other metadata fields.
             identifiers : List
                 Any asset identifiers that are not provided in the
-                asset_metadata, but will be traded by this TradingAlgorithm
+                equities_metadata, but will be traded by this TradingAlgorithm
         """
         self.sources = []
 
@@ -175,7 +186,7 @@ class TradingAlgorithm(object):
         self.account_controls = []
 
         self._recorded_vars = {}
-        self.namespace = kwargs.get('namespace', {})
+        self.namespace = kwargs.pop('namespace', {})
 
         self._platform = kwargs.pop('platform', 'zipline')
 
@@ -189,34 +200,45 @@ class TradingAlgorithm(object):
 
         self.instant_fill = kwargs.pop('instant_fill', False)
 
+        # If an env has been provided, pop it
+        self.trading_environment = kwargs.pop('env', None)
+
+        if self.trading_environment is None:
+            self.trading_environment = TradingEnvironment()
+
+        # Update the TradingEnvironment with the provided asset metadata
+        self.trading_environment.write_data(
+            equities_data=kwargs.pop('equities_metadata', {}),
+            equities_identifiers=kwargs.pop('identifiers', []),
+            futures_data=kwargs.pop('futures_metadata', {}),
+        )
+
         # set the capital base
         self.capital_base = kwargs.pop('capital_base', DEFAULT_CAPITAL_BASE)
-
         self.sim_params = kwargs.pop('sim_params', None)
         if self.sim_params is None:
             self.sim_params = create_simulation_parameters(
                 capital_base=self.capital_base,
                 start=kwargs.pop('start', None),
-                end=kwargs.pop('end', None)
+                end=kwargs.pop('end', None),
+                env=self.trading_environment,
             )
-        self.perf_tracker = PerformanceTracker(self.sim_params)
+        else:
+            self.sim_params.update_internal_from_env(self.trading_environment)
 
-        # Update the TradingEnvironment with the provided asset metadata
-        self.trading_environment = kwargs.pop('env',
-                                              TradingEnvironment.instance())
-        self.trading_environment.update_asset_finder(
-            asset_finder=kwargs.pop('asset_finder', None),
-            asset_metadata=kwargs.pop('asset_metadata', None),
-            identifiers=kwargs.pop('identifiers', None)
-        )
+        # Build a perf_tracker
+        self.perf_tracker = PerformanceTracker(sim_params=self.sim_params,
+                                               env=self.trading_environment)
+
         # Pull in the environment's new AssetFinder for quick reference
         self.asset_finder = self.trading_environment.asset_finder
-        self.init_engine(kwargs.pop('ffc_loader', None))
 
-        # Maps from name to Term
-        self._filters = {}
-        self._factors = {}
-        self._classifiers = {}
+        # Initialize Pipeline API data.
+        self.init_engine(kwargs.pop('get_pipeline_loader', None))
+        self._pipelines = {}
+        # Create an always-expired cache so that we compute the first time data
+        # is requested.
+        self._pipeline_cache = CachedObject(None, pd.Timestamp(0, tz='UTC'))
 
         self.blotter = kwargs.pop('blotter', None)
         if not self.blotter:
@@ -224,6 +246,10 @@ class TradingAlgorithm(object):
 
         # Set the dt initally to the period start by forcing it to change
         self.on_dt_changed(self.sim_params.period_start)
+
+        # The symbol lookup date specifies the date to use when resolving
+        # symbols to sids, and can be set using set_symbol_lookup_date()
+        self._symbol_lookup_date = None
 
         self.portfolio_needs_update = True
         self.account_needs_update = True
@@ -245,7 +271,9 @@ class TradingAlgorithm(object):
         self._before_trading_start = None
         self._analyze = None
 
-        self.event_manager = EventManager()
+        self.event_manager = EventManager(
+            create_context=kwargs.pop('create_event_context', None),
+        )
 
         if self.algoscript is not None:
             filename = kwargs.pop('algo_filename', None)
@@ -272,6 +300,7 @@ class TradingAlgorithm(object):
             self._handle_data = kwargs.pop('handle_data')
             self._before_trading_start = kwargs.pop('before_trading_start',
                                                     None)
+            self._analyze = kwargs.pop('analyze', None)
 
         self.event_manager.add_event(
             zipline.utils.events.Event(
@@ -299,20 +328,20 @@ class TradingAlgorithm(object):
         self.initialize_args = args
         self.initialize_kwargs = kwargs
 
-    def init_engine(self, loader):
+    def init_engine(self, get_loader):
         """
-        Construct and save an FFCEngine from loader.
+        Construct and store a PipelineEngine from loader.
 
-        If loader is None, constructs a NoOpFFCEngine.
+        If get_loader is None, constructs a NoOpPipelineEngine.
         """
-        if loader is not None:
-            self.engine = SimpleFFCEngine(
-                loader,
+        if get_loader is not None:
+            self.engine = SimplePipelineEngine(
+                get_loader,
                 self.trading_environment.trading_days,
                 self.asset_finder,
             )
         else:
-            self.engine = NoOpFFCEngine()
+            self.engine = NoOpPipelineEngine()
 
     def initialize(self, *args, **kwargs):
         """
@@ -320,7 +349,7 @@ class TradingAlgorithm(object):
         functions.
         """
         with ZiplineAPI(self):
-            self._initialize(self)
+            self._initialize(self, *args, **kwargs)
 
     def before_trading_start(self, data):
         if self._before_trading_start is None:
@@ -436,7 +465,9 @@ class TradingAlgorithm(object):
         if self.perf_tracker is None:
             # HACK: When running with the `run` method, we set perf_tracker to
             # None so that it will be overwritten here.
-            self.perf_tracker = PerformanceTracker(sim_params)
+            self.perf_tracker = PerformanceTracker(
+                sim_params=sim_params, env=self.trading_environment
+            )
 
         self.portfolio_needs_update = True
         self.account_needs_update = True
@@ -495,18 +526,17 @@ class TradingAlgorithm(object):
             # if DataFrame provided, map columns to sids and wrap
             # in DataFrameSource
             copy_frame = source.copy()
-            copy_frame.columns = \
-                self.asset_finder.map_identifier_index_to_sids(
-                    source.columns, source.index[0]
-                )
+            copy_frame.columns = self._write_and_map_id_index_to_sids(
+                source.columns, source.index[0],
+            )
             source = DataFrameSource(copy_frame)
 
         elif isinstance(source, pd.Panel):
             # If Panel provided, map items to sids and wrap
             # in DataPanelSource
             copy_panel = source.copy()
-            copy_panel.items = self.asset_finder.map_identifier_index_to_sids(
-                source.items, source.major_axis[0]
+            copy_panel.items = self._write_and_map_id_index_to_sids(
+                source.items, source.major_axis[0],
             )
             source = DataPanelSource(copy_panel)
 
@@ -523,19 +553,17 @@ class TradingAlgorithm(object):
                 self.sim_params.period_end = source.end
             # Changing period_start and period_close might require updating
             # of first_open and last_close.
-            self.sim_params._update_internal()
+            self.sim_params.update_internal_from_env(
+                env=self.trading_environment
+            )
 
         # The sids field of the source is the reference for the universe at
         # the start of the run
-        self._current_universe = set()
-        for source in self.sources:
-            for sid in source.sids:
-                self._current_universe.add(sid)
+        sids = {sid for source in self.sources for sid in source.sids}
         # Check that all sids from the source are accounted for in
         # the AssetFinder. This retrieve call will raise an exception if the
         # sid is not found.
-        for sid in self._current_universe:
-            self.asset_finder.retrieve_asset(sid)
+        self._current_universe = set(self.asset_finder.retrieve_all(sids))
 
         # force a reset of the performance tracker, in case
         # this is a repeat run of the algorithm.
@@ -551,6 +579,7 @@ class TradingAlgorithm(object):
                 self.current_universe(),
                 self.sim_params.first_open,
                 self.sim_params.data_frequency,
+                self.trading_environment,
             )
 
         # loop through simulated_trading, each iteration returns a
@@ -565,6 +594,35 @@ class TradingAlgorithm(object):
         self.analyze(daily_stats)
 
         return daily_stats
+
+    def _write_and_map_id_index_to_sids(self, identifiers, as_of_date):
+        # Build new Assets for identifiers that can't be resolved as
+        # sids/Assets
+        identifiers_to_build = []
+        for identifier in identifiers:
+            asset = None
+
+            if isinstance(identifier, Asset):
+                asset = self.asset_finder.retrieve_asset(sid=identifier.sid,
+                                                         default_none=True)
+            elif isinstance(identifier, Integral):
+                asset = self.asset_finder.retrieve_asset(sid=identifier,
+                                                         default_none=True)
+            if asset is None:
+                identifiers_to_build.append(identifier)
+
+        self.trading_environment.write_data(
+            equities_identifiers=identifiers_to_build)
+
+        # We need to clear out any cache misses that were stored while trying
+        # to do lookups.  The real fix for this problem is to not construct an
+        # AssetFinder until we `run()` when we actually have all the data we
+        # need to so.
+        self.asset_finder._reset_caches()
+
+        return self.asset_finder.map_identifier_index_to_sids(
+            identifiers, as_of_date,
+        )
 
     def _create_daily_stats(self, perfs):
         # create daily and cumulative stats dataframe
@@ -688,14 +746,20 @@ class TradingAlgorithm(object):
             self._recorded_vars[name] = value
 
     @api_method
+    @preprocess(symbol_str=ensure_upper_case)
     def symbol(self, symbol_str):
         """
         Default symbol lookup for any source that directly maps the
         symbol to the Asset (e.g. yahoo finance).
         """
-        return self.asset_finder.lookup_symbol_resolve_multiple(
+        # If the user has not set the symbol lookup date,
+        # use the period_end as the date for sybmol->sid resolution.
+        _lookup_date = self._symbol_lookup_date if self._symbol_lookup_date is not None \
+            else self.sim_params.period_end
+
+        return self.asset_finder.lookup_symbol(
             symbol_str,
-            as_of_date=self.sim_params.period_end
+            as_of_date=_lookup_date,
         )
 
     @api_method
@@ -715,6 +779,30 @@ class TradingAlgorithm(object):
         return self.asset_finder.retrieve_asset(a_sid)
 
     @api_method
+    @preprocess(symbol=ensure_upper_case)
+    def future_symbol(self, symbol):
+        """ Lookup a futures contract with a given symbol.
+
+        Parameters
+        ----------
+        symbol : str
+            The symbol of the desired contract.
+
+        Returns
+        -------
+        Future
+            A Future object.
+
+        Raises
+        ------
+        SymbolNotFound
+            Raised when no contract named 'symbol' is found.
+
+        """
+        return self.asset_finder.lookup_future_symbol(symbol)
+
+    @api_method
+    @preprocess(root_symbol=ensure_upper_case)
     def future_chain(self, root_symbol, as_of_date=None):
         """ Look up a future chain with the specified parameters.
 
@@ -737,10 +825,16 @@ class TradingAlgorithm(object):
         RootSymbolNotFound
             If a future chain could not be found for the given root symbol.
         """
+        if as_of_date:
+            try:
+                as_of_date = pd.Timestamp(as_of_date, tz='UTC')
+            except ValueError:
+                raise UnsupportedDatetimeFormat(input=as_of_date,
+                                                method='future_chain')
         return FutureChain(
             asset_finder=self.asset_finder,
             get_datetime=self.get_datetime,
-            root_symbol=root_symbol.upper(),
+            root_symbol=root_symbol,
             as_of_date=as_of_date
         )
 
@@ -761,7 +855,7 @@ class TradingAlgorithm(object):
             return 0
 
         if isinstance(asset, Future):
-            value_multiplier = asset.contract_multiplier
+            value_multiplier = asset.multiplier
         else:
             value_multiplier = 1
 
@@ -974,7 +1068,7 @@ class TradingAlgorithm(object):
         if not isinstance(slippage, SlippageModel):
             raise UnsupportedSlippageModel()
         if self.initialized:
-            raise OverrideSlippagePostInit()
+            raise SetSlippagePostInit()
         self.slippage = slippage
 
     @api_method
@@ -983,8 +1077,21 @@ class TradingAlgorithm(object):
             raise UnsupportedCommissionModel()
 
         if self.initialized:
-            raise OverrideCommissionPostInit()
+            raise SetCommissionPostInit()
         self.commission = commission
+
+    @api_method
+    def set_symbol_lookup_date(self, dt):
+        """
+        Set the date for which symbols will be resolved to their sids
+        (symbols may map to different firms or underlying assets at
+        different times)
+        """
+        try:
+            self._symbol_lookup_date = pd.Timestamp(dt, tz='UTC')
+        except ValueError:
+            raise UnsupportedDatetimeFormat(input=dt,
+                                            method='set_symbol_lookup_date')
 
     def set_sources(self, sources):
         assert isinstance(sources, list)
@@ -1104,7 +1211,8 @@ class TradingAlgorithm(object):
     def add_history(self, bar_count, frequency, field, ffill=True):
         data_frequency = self.sim_params.data_frequency
         history_spec = HistorySpec(bar_count, frequency, field, ffill,
-                                   data_frequency=data_frequency)
+                                   data_frequency=data_frequency,
+                                   env=self.trading_environment)
         self.history_specs[history_spec.key_str] = history_spec
         if self.initialized:
             if self.history_container:
@@ -1117,6 +1225,7 @@ class TradingAlgorithm(object):
                     self.current_universe(),
                     self.sim_params.first_open,
                     self.sim_params.data_frequency,
+                    env=self.trading_environment,
                 )
 
     def get_history_spec(self, bar_count, frequency, field, ffill):
@@ -1129,6 +1238,7 @@ class TradingAlgorithm(object):
                 field,
                 ffill,
                 data_frequency=data_freq,
+                env=self.trading_environment,
             )
             self.history_specs[spec_key] = spec
             if not self.history_container:
@@ -1138,6 +1248,7 @@ class TradingAlgorithm(object):
                     self.datetime,
                     self.sim_params.data_frequency,
                     bar_data=self._most_recent_data,
+                    env=self.trading_environment,
                 )
             self.history_container.ensure_spec(
                 spec, self.datetime, self._most_recent_data,
@@ -1145,6 +1256,7 @@ class TradingAlgorithm(object):
         return self.history_specs[spec_key]
 
     @api_method
+    @require_initialized(HistoryInInitialize())
     def history(self, bar_count, frequency, field, ffill=True):
         history_spec = self.get_history_spec(
             bar_count,
@@ -1254,48 +1366,122 @@ class TradingAlgorithm(object):
         """
         self.register_trading_control(LongOnly())
 
-    ###########
-    # FFC API #
-    ###########
+    ##############
+    # Pipeline API
+    ##############
     @api_method
-    @require_not_initialized(AddTermPostInit())
-    def add_factor(self, factor, name):
-        if name in self._factors:
-            raise ValueError("Name %r is already a factor!" % name)
-        self._factors[name] = factor
-
-    @api_method
-    @require_not_initialized(AddTermPostInit())
-    def add_filter(self, filter):
-        name = "anon_filter_%d" % len(self._filters)
-        self._filters[name] = filter
-
-    # Note: add_classifier is not yet implemented since you can't do anything
-    # useful with classifiers yet.
-
-    def _all_terms(self):
-        # Merge all three dicts.
-        return dict(
-            chain.from_iterable(
-                iteritems(terms)
-                for terms in (self._filters, self._factors, self._classifiers)
-            )
-        )
-
-    def compute_factor_matrix(self, start_date):
+    @require_not_initialized(AttachPipelineAfterInitialize())
+    def attach_pipeline(self, pipeline, name, chunksize=None):
         """
-        Compute a factor matrix starting at start_date.
+        Register a pipeline to be computed at the start of each day.
+        """
+        if self._pipelines:
+            raise NotImplementedError("Multiple pipelines are not supported.")
+        if chunksize is None:
+            # Make the first chunk smaller to get more immediate results:
+            # (one week, then every half year)
+            chunks = iter(chain([5], repeat(126)))
+        else:
+            chunks = iter(repeat(int(chunksize)))
+        self._pipelines[name] = pipeline, chunks
+
+        # Return the pipeline to allow expressions like
+        # p = attach_pipeline(Pipeline(), 'name')
+        return pipeline
+
+    @api_method
+    @require_initialized(PipelineOutputDuringInitialize())
+    def pipeline_output(self, name):
+        """
+        Get the results of pipeline with name `name`.
+
+        Parameters
+        ----------
+        name : str
+            Name of the pipeline for which results are requested.
+
+        Returns
+        -------
+        results : pd.DataFrame
+            DataFrame containing the results of the requested pipeline for
+            the current simulation date.
+
+        Raises
+        ------
+        NoSuchPipeline
+            Raised when no pipeline with the name `name` has been registered.
+
+        See Also
+        --------
+        :meth:`zipline.pipeline.engine.PipelineEngine.run_pipeline`
+        """
+        # NOTE: We don't currently support multiple pipelines, but we plan to
+        # in the future.
+        try:
+            p, chunks = self._pipelines[name]
+        except KeyError:
+            raise NoSuchPipeline(
+                name=name,
+                valid=list(self._pipelines.keys()),
+            )
+        return self._pipeline_output(p, chunks)
+
+    def _pipeline_output(self, pipeline, chunks):
+        """
+        Internal implementation of `pipeline_output`.
+        """
+        today = normalize_date(self.get_datetime())
+        try:
+            data = self._pipeline_cache.unwrap(today)
+        except Expired:
+            data, valid_until = self._run_pipeline(
+                pipeline, today, next(chunks),
+            )
+            self._pipeline_cache = CachedObject(data, valid_until)
+
+        # Now that we have a cached result, try to return the data for today.
+        try:
+            return data.loc[today]
+        except KeyError:
+            # This happens if no assets passed the pipeline screen on a given
+            # day.
+            return pd.DataFrame(index=[], columns=data.columns)
+
+    def _run_pipeline(self, pipeline, start_date, chunksize):
+        """
+        Compute `pipeline`, providing values for at least `start_date`.
+
+        Produces a DataFrame containing data for days between `start_date` and
+        `end_date`, where `end_date` is defined by:
+
+            `end_date = min(start_date + chunksize trading days,
+                            simulation_end)`
+
+        Returns
+        -------
+        (data, valid_until) : tuple (pd.DataFrame, pd.Timestamp)
+
+        See Also
+        --------
+        PipelineEngine.run_pipeline
         """
         days = self.trading_environment.trading_days
+
+        # Load data starting from the previous trading day...
         start_date_loc = days.get_loc(start_date)
+
+        # ...continuing until either the day before the simulation end, or
+        # until chunksize days of data have been loaded.
         sim_end = self.sim_params.last_close.normalize()
-        end_loc = min(start_date_loc + 252, days.get_loc(sim_end))
+        end_loc = min(start_date_loc + chunksize, days.get_loc(sim_end))
         end_date = days[end_loc]
-        return self.engine.factor_matrix(
-            self._all_terms(),
-            start_date,
-            end_date,
-        ), end_date
+
+        return \
+            self.engine.run_pipeline(pipeline, start_date, end_date), end_date
+
+    ##################
+    # End Pipeline API
+    ##################
 
     def current_universe(self):
         return self._current_universe

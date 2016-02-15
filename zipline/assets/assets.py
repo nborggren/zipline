@@ -14,447 +14,565 @@
 
 from abc import ABCMeta
 from numbers import Integral
-import numpy as np
-import sqlite3
-from sqlite3 import Row
-import warnings
+from operator import itemgetter
 
 from logbook import Logger
+import numpy as np
 import pandas as pd
-from pandas.tseries.tools import normalize_date
-from six import with_metaclass, string_types
+from pandas import isnull
+from six import with_metaclass, string_types, viewkeys
+from six.moves import map as imap, range
+import sqlalchemy as sa
 
 from zipline.errors import (
-    ConsumeAssetMetaDataError,
-    InvalidAssetType,
+    EquitiesNotFound,
+    FutureContractsNotFound,
+    MapAssetIdentifierIndexError,
     MultipleSymbolsFound,
     RootSymbolNotFound,
-    SidAssignmentError,
-    SidNotFound,
+    SidsNotFound,
     SymbolNotFound,
-    MapAssetIdentifierIndexError,
 )
-from zipline.assets._assets import (
-    Asset, Equity, Future
+from zipline.assets import (
+    Asset, Equity, Future,
 )
+from zipline.assets.asset_writer import (
+    check_version_info,
+    split_delimited_symbol,
+    asset_db_table_names,
+    SQLITE_MAX_VARIABLE_NUMBER,
+)
+from zipline.assets.asset_db_schema import (
+    ASSET_DB_VERSION
+)
+from zipline.utils.control_flow import invert
 
 log = Logger('assets.py')
 
-# Expected fields for an Asset's metadata
-ASSET_FIELDS = [
-    'sid',
-    'asset_type',
+# A set of fields that need to be converted to strings before building an
+# Asset to avoid unicode fields
+_asset_str_fields = frozenset({
     'symbol',
-    'root_symbol',
     'asset_name',
+    'exchange',
+})
+
+# A set of fields that need to be converted to timestamps in UTC
+_asset_timestamp_fields = frozenset({
     'start_date',
     'end_date',
     'first_traded',
-    'exchange',
     'notice_date',
     'expiration_date',
-    'contract_multiplier',
-    # The following fields are for compatibility with other systems
-    'file_name',  # Used as symbol
-    'company_name',  # Used as asset_name
-    'start_date_nano',  # Used as start_date
-    'end_date_nano',  # Used as end_date
-]
+    'auto_close_date',
+})
 
 
-# Expected fields for an Asset's metadata
-ASSET_TABLE_FIELDS = [
-    'sid',
-    'symbol',
-    'asset_name',
-    'start_date',
-    'end_date',
-    'first_traded',
-    'exchange',
-]
-
-
-# Expected fields for an Asset's metadata
-FUTURE_TABLE_FIELDS = ASSET_TABLE_FIELDS + [
-    'root_symbol',
-    'notice_date',
-    'expiration_date',
-    'contract_multiplier',
-]
-
-EQUITY_TABLE_FIELDS = ASSET_TABLE_FIELDS
-
-
-# Create the query once from the fields, so that the join is not done
-# repeatedly.
-FUTURE_BY_SID_QUERY = 'select {0} from futures where sid=?'.format(
-    ", ".join(FUTURE_TABLE_FIELDS))
-
-EQUITY_BY_SID_QUERY = 'select {0} from equities where sid=?'.format(
-    ", ".join(EQUITY_TABLE_FIELDS))
+def _convert_asset_timestamp_fields(dict_):
+    """
+    Takes in a dict of Asset init args and converts dates to pd.Timestamps
+    """
+    for key in (_asset_timestamp_fields & viewkeys(dict_)):
+        value = pd.Timestamp(dict_[key], tz='UTC')
+        dict_[key] = None if isnull(value) else value
+    return dict_
 
 
 class AssetFinder(object):
+    """
+    An AssetFinder is an interface to a database of Asset metadata written by
+    an ``AssetDBWriter``.
 
-    def __init__(self,
-                 metadata=None,
-                 allow_sid_assignment=True,
-                 fuzzy_char=None,
-                 db_path=':memory:',
-                 create_table=True):
+    This class provides methods for looking up assets by unique integer id or
+    by symbol.  For historical reasons, we refer to these unique ids as 'sids'.
 
-        self.fuzzy_char = fuzzy_char
+    Parameters
+    ----------
+    engine : str or SQLAlchemy.engine
+        An engine with a connection to the asset database to use, or a string
+        that can be parsed by SQLAlchemy as a URI.
 
-        # This flag controls if the AssetFinder is allowed to generate its own
-        # sids. If False, metadata that does not contain a sid will raise an
-        # exception when building assets.
-        self.allow_sid_assignment = allow_sid_assignment
+    See Also
+    --------
+    :class:`zipline.assets.asset_writer.AssetDBWriter`
+    """
+    # Token used as a substitute for pickling objects that contain a
+    # reference to an AssetFinder.
+    PERSISTENT_TOKEN = "<AssetFinder>"
 
-        if allow_sid_assignment:
-            self.end_date_to_assign = normalize_date(
-                pd.Timestamp('now', tz='UTC'))
+    def __init__(self, engine):
 
-        self.conn = sqlite3.connect(db_path)
-        self.conn.text_factory = str
-        self.cursor = self.conn.cursor()
+        self.engine = engine
+        metadata = sa.MetaData(bind=engine)
+        metadata.reflect(only=asset_db_table_names)
+        for table_name in asset_db_table_names:
+            setattr(self, table_name, metadata.tables[table_name])
 
-        # The AssetFinder also holds a nested-dict of all metadata for
-        # reference when building Assets
-        self.metadata_cache = {}
+        # Check the version info of the db for compatibility
+        check_version_info(self.version_info, ASSET_DB_VERSION)
 
-        # Create table and read in metadata.
-        # Should we use flags like 'r', 'w', instead?
-        # What we need to support is:
-        # - A 'throwaway' mode where the metadata is read each run.
-        # - A 'write' mode where the data is written to the provided db_path
-        # - A 'read' mode where the asset finder uses a prexisting db.
-        if create_table:
-            self.create_db_tables()
-            if metadata is not None:
-                self.consume_metadata(metadata)
-
-        # Cache for lookup of assets by sid, the objects in the asset lookp may
-        # be shared with the results from equity and future lookup caches.
+        # Cache for lookup of assets by sid, the objects in the asset lookup
+        # may be shared with the results from equity and future lookup caches.
         #
         # The top level cache exists to minimize lookups on the asset type
         # routing.
         #
         # The caches are read through, i.e. accessing an asset through
-        # retrieve_asset, _retrieve_equity etc. will populate the cache on
-        # first retrieval.
-        self._asset_cache = {}
-        self._equity_cache = {}
-        self._future_cache = {}
-
-        self._asset_type_cache = {}
+        # retrieve_asset will populate the cache on first retrieval.
+        self._caches = (self._asset_cache, self._asset_type_cache) = {}, {}
 
         # Populated on first call to `lifetimes`.
         self._asset_lifetimes = None
 
-    def create_db_tables(self):
-        c = self.conn.cursor()
+    def _reset_caches(self):
+        """
+        Reset our asset caches.
 
-        c.execute("""
-        CREATE TABLE equities(
-        sid integer,
-        symbol text,
-        asset_name text,
-        start_date integer,
-        end_date integer,
-        first_traded integer,
-        exchange text,
-        fuzzy text
-        )""")
+        You probably shouldn't call this method.
+        """
+        # This method exists as a workaround for the in-place mutating behavior
+        # of `TradingAlgorithm._write_and_map_id_index_to_sids`.  No one else
+        # should be calling this.
+        for cache in self._caches:
+            cache.clear()
 
-        c.execute('CREATE INDEX equities_sid on equities(sid)')
-        c.execute('CREATE INDEX equities_symbol on equities(symbol)')
-        c.execute('CREATE INDEX equities_fuzzy on equities(fuzzy)')
+    def lookup_asset_types(self, sids):
+        """
+        Retrieve asset types for a list of sids.
 
-        c.execute("""
-        CREATE TABLE futures(
-        sid integer,
-        symbol text,
-        asset_name text,
-        start_date integer,
-        end_date integer,
-        first_traded integer,
-        exchange text,
-        root_symbol text,
-        notice_date integer,
-        expiration_date integer,
-        contract_multiplier real
-        )""")
+        Parameters
+        ----------
+        sids : list[int]
 
-        c.execute('CREATE INDEX futures_sid on futures(sid)')
-        c.execute('CREATE INDEX futures_root_symbol on equities(symbol)')
+        Returns
+        -------
+        types : dict[sid -> str or None]
+            Asset types for the provided sids.
+        """
+        found = {}
+        missing = set()
 
-        c.execute("""
-        CREATE TABLE asset_router
-        (sid integer,
-        asset_type text)
-        """)
+        for sid in sids:
+            try:
+                found[sid] = self._asset_type_cache[sid]
+            except KeyError:
+                missing.add(sid)
 
-        c.execute('CREATE INDEX asset_router_sid on asset_router(sid)')
+        if not missing:
+            return found
 
-        self.conn.commit()
+        router_cols = self.asset_router.c
 
-    def asset_type_by_sid(self, sid):
-        try:
-            return self._asset_type_cache[sid]
-        except KeyError:
-            pass
+        for assets in self._group_into_chunks(missing):
+            query = sa.select((router_cols.sid, router_cols.asset_type)).where(
+                self.asset_router.c.sid.in_(map(int, assets))
+            )
+            for sid, type_ in query.execute().fetchall():
+                missing.remove(sid)
+                found[sid] = self._asset_type_cache[sid] = type_
 
-        c = self.conn.cursor()
-        # Python 3 compatibility required forcing to int for sid = 0.
-        t = (int(sid),)
-        query = 'select asset_type from asset_router where sid=:sid'
-        c.execute(query, t)
-        data = c.fetchone()
-        if data is None:
-            return
+            for sid in missing:
+                found[sid] = self._asset_type_cache[sid] = None
 
-        asset_type = data[0]
-        self._asset_type_cache[sid] = asset_type
+        return found
 
-        return asset_type
+    @staticmethod
+    def _group_into_chunks(items, chunk_size=SQLITE_MAX_VARIABLE_NUMBER):
+        items = list(items)
+        return [items[x:x+chunk_size]
+                for x in range(0, len(items), chunk_size)]
+
+    def group_by_type(self, sids):
+        """
+        Group a list of sids by asset type.
+
+        Parameters
+        ----------
+        sids : list[int]
+
+        Returns
+        -------
+        types : dict[str or None -> list[int]]
+            A dict mapping unique asset types to lists of sids drawn from sids.
+            If we fail to look up an asset, we assign it a key of None.
+        """
+        return invert(self.lookup_asset_types(sids))
 
     def retrieve_asset(self, sid, default_none=False):
-        if isinstance(sid, Asset):
-            return sid
-
-        try:
-            asset = self._asset_cache[sid]
-        except KeyError:
-            asset_type = self.asset_type_by_sid(sid)
-            if asset_type == 'equity':
-                asset = self._retrieve_equity(sid)
-            elif asset_type == 'future':
-                asset = self._retrieve_futures_contract(sid)
-            else:
-                asset = None
-
-            self._asset_cache[sid] = asset
-
-        if asset is not None:
-            return asset
-        elif default_none:
-            return None
-        else:
-            raise SidNotFound(sid=sid)
+        """
+        Retrieve the Asset for a given sid.
+        """
+        return self.retrieve_all((sid,), default_none=default_none)[0]
 
     def retrieve_all(self, sids, default_none=False):
-        return [self.retrieve_asset(sid) for sid in sids]
+        """
+        Retrieve all assets in `sids`.
+
+        Parameters
+        ----------
+        sids : interable of int
+            Assets to retrieve.
+        default_none : bool
+            If True, return None for failed lookups.
+            If False, raise `SidsNotFound`.
+
+        Returns
+        -------
+        assets : list[int or None]
+            A list of the same length as `sids` containing Assets (or Nones)
+            corresponding to the requested sids.
+
+        Raises
+        ------
+        SidsNotFound
+            When a requested sid is not found and default_none=False.
+        """
+        hits, missing, failures = {}, set(), []
+        for sid in sids:
+            try:
+                asset = self._asset_cache[sid]
+                if not default_none and asset is None:
+                    # Bail early if we've already cached that we don't know
+                    # about an asset.
+                    raise SidsNotFound(sids=[sid])
+                hits[sid] = asset
+            except KeyError:
+                missing.add(sid)
+
+        # All requests were cache hits.  Return requested sids in order.
+        if not missing:
+            return [hits[sid] for sid in sids]
+
+        update_hits = hits.update
+
+        # Look up cache misses by type.
+        type_to_assets = self.group_by_type(missing)
+
+        # Handle failures
+        failures = {failure: None for failure in type_to_assets.pop(None, ())}
+        update_hits(failures)
+        self._asset_cache.update(failures)
+
+        if failures and not default_none:
+            raise SidsNotFound(sids=list(failures))
+
+        # We don't update the asset cache here because it should already be
+        # updated by `self.retrieve_equities`.
+        update_hits(self.retrieve_equities(type_to_assets.pop('equity', ())))
+        update_hits(
+            self.retrieve_futures_contracts(type_to_assets.pop('future', ()))
+        )
+
+        # We shouldn't know about any other asset types.
+        if type_to_assets:
+            raise AssertionError(
+                "Found asset types: %s" % list(type_to_assets.keys())
+            )
+
+        return [hits[sid] for sid in sids]
+
+    def retrieve_equities(self, sids):
+        """
+        Retrieve Equity objects for a list of sids.
+
+        Users generally shouldn't need to this method (instead, they should
+        prefer the more general/friendly `retrieve_assets`), but it has a
+        documented interface and tests because it's used upstream.
+
+        Parameters
+        ----------
+        sids : iterable[int]
+
+        Returns
+        -------
+        equities : dict[int -> Equity]
+
+        Raises
+        ------
+        EquitiesNotFound
+            When any requested asset isn't found.
+        """
+        return self._retrieve_assets(sids, self.equities, Equity)
 
     def _retrieve_equity(self, sid):
-        try:
-            return self._equity_cache[sid]
-        except KeyError:
-            pass
+        return self.retrieve_equities((sid,))[sid]
 
-        c = self.conn.cursor()
-        c.row_factory = Row
-        t = (int(sid),)
-        c.execute(EQUITY_BY_SID_QUERY, t)
-        data = dict(c.fetchone())
-        if data:
-            if data['start_date']:
-                data['start_date'] = pd.Timestamp(data['start_date'], tz='UTC')
-
-            if data['end_date']:
-                data['end_date'] = pd.Timestamp(data['end_date'], tz='UTC')
-
-            if data['first_traded']:
-                data['first_traded'] = pd.Timestamp(
-                    data['first_traded'], tz='UTC')
-
-            equity = Equity(**data)
-        else:
-            equity = None
-
-        self._equity_cache[sid] = equity
-        return equity
-
-    def _retrieve_futures_contract(self, sid):
-        try:
-            return self._future_cache[sid]
-        except KeyError:
-            pass
-
-        c = self.conn.cursor()
-        t = (int(sid),)
-        c.row_factory = Row
-        c.execute(FUTURE_BY_SID_QUERY, t)
-        data = dict(c.fetchone())
-        if data:
-            if data['start_date']:
-                data['start_date'] = pd.Timestamp(data['start_date'], tz='UTC')
-
-            if data['end_date']:
-                data['end_date'] = pd.Timestamp(data['end_date'], tz='UTC')
-
-            if data['first_traded']:
-                data['first_traded'] = pd.Timestamp(
-                    data['first_traded'], tz='UTC')
-
-            if data['notice_date']:
-                data['notice_date'] = pd.Timestamp(
-                    data['notice_date'], tz='UTC')
-
-            if data['expiration_date']:
-                data['expiration_date'] = pd.Timestamp(
-                    data['expiration_date'], tz='UTC')
-
-            future = Future(**data)
-        else:
-            future = None
-
-        self._future_cache[sid] = future
-        return future
-
-    def lookup_symbol_resolve_multiple(self, symbol, as_of_date=None):
+    def retrieve_futures_contracts(self, sids):
         """
-        Return matching Asset of name symbol in database.
+        Retrieve Future objects for an iterable of sids.
 
-        If multiple Assets are found and as_of_date is not set,
+        Users generally shouldn't need to this method (instead, they should
+        prefer the more general/friendly `retrieve_assets`), but it has a
+        documented interface and tests because it's used upstream.
+
+        Parameters
+        ----------
+        sids : iterable[int]
+
+        Returns
+        -------
+        equities : dict[int -> Equity]
+
+        Raises
+        ------
+        EquitiesNotFound
+            When any requested asset isn't found.
+        """
+        return self._retrieve_assets(sids, self.futures_contracts, Future)
+
+    @staticmethod
+    def _select_assets_by_sid(asset_tbl, sids):
+        return sa.select([asset_tbl]).where(
+            asset_tbl.c.sid.in_(map(int, sids))
+        )
+
+    @staticmethod
+    def _select_asset_by_symbol(asset_tbl, symbol):
+        return sa.select([asset_tbl]).where(asset_tbl.c.symbol == symbol)
+
+    def _retrieve_assets(self, sids, asset_tbl, asset_type):
+        """
+        Internal function for loading assets from a table.
+
+        This should be the only method of `AssetFinder` that writes Assets into
+        self._asset_cache.
+
+        Parameters
+        ---------
+        sids : iterable of int
+            Asset ids to look up.
+        asset_tbl : sqlalchemy.Table
+            Table from which to query assets.
+        asset_type : type
+            Type of asset to be constructed.
+
+        Returns
+        -------
+        assets : dict[int -> Asset]
+            Dict mapping requested sids to the retrieved assets.
+        """
+        # Fastpath for empty request.
+        if not sids:
+            return {}
+
+        cache = self._asset_cache
+        hits = {}
+
+        for assets in self._group_into_chunks(sids):
+            # Load misses from the db.
+            query = self._select_assets_by_sid(asset_tbl, assets)
+
+            for row in imap(dict, query.execute().fetchall()):
+                asset = asset_type(**_convert_asset_timestamp_fields(row))
+                sid = asset.sid
+                hits[sid] = cache[sid] = asset
+
+        # If we get here, it means something in our code thought that a
+        # particular sid was an equity/future and called this function with a
+        # concrete type, but we couldn't actually resolve the asset.  This is
+        # an error in our code, not a user-input error.
+        misses = tuple(set(sids) - viewkeys(hits))
+        if misses:
+            if asset_type == Equity:
+                raise EquitiesNotFound(sids=misses)
+            else:
+                raise FutureContractsNotFound(sids=misses)
+        return hits
+
+    def _get_fuzzy_candidates(self, fuzzy_symbol):
+        candidates = sa.select(
+            (self.equities.c.sid,)
+        ).where(self.equities.c.fuzzy_symbol == fuzzy_symbol).order_by(
+            self.equities.c.start_date.desc(),
+            self.equities.c.end_date.desc()
+        ).execute().fetchall()
+        return candidates
+
+    def _get_fuzzy_candidates_in_range(self, fuzzy_symbol, ad_value):
+        candidates = sa.select(
+            (self.equities.c.sid,)
+        ).where(
+            sa.and_(
+                self.equities.c.fuzzy_symbol == fuzzy_symbol,
+                self.equities.c.start_date <= ad_value,
+                self.equities.c.end_date >= ad_value
+            )
+        ).order_by(
+            self.equities.c.start_date.desc(),
+            self.equities.c.end_date.desc(),
+        ).execute().fetchall()
+        return candidates
+
+    def _get_split_candidates_in_range(self,
+                                       company_symbol,
+                                       share_class_symbol,
+                                       ad_value):
+        candidates = sa.select(
+            (self.equities.c.sid,)
+        ).where(
+            sa.and_(
+                self.equities.c.company_symbol == company_symbol,
+                self.equities.c.share_class_symbol == share_class_symbol,
+                self.equities.c.start_date <= ad_value,
+                self.equities.c.end_date >= ad_value
+            )
+        ).order_by(
+            self.equities.c.start_date.desc(),
+            self.equities.c.end_date.desc(),
+        ).execute().fetchall()
+        return candidates
+
+    def _get_split_candidates(self, company_symbol, share_class_symbol):
+        candidates = sa.select(
+            (self.equities.c.sid,)
+        ).where(
+            sa.and_(
+                self.equities.c.company_symbol == company_symbol,
+                self.equities.c.share_class_symbol == share_class_symbol
+            )
+        ).order_by(
+            self.equities.c.start_date.desc(),
+            self.equities.c.end_date.desc(),
+        ).execute().fetchall()
+        return candidates
+
+    def _resolve_no_matching_candidates(self,
+                                        company_symbol,
+                                        share_class_symbol,
+                                        ad_value):
+        candidates = sa.select((self.equities.c.sid,)).where(
+            sa.and_(
+                self.equities.c.company_symbol == company_symbol,
+                self.equities.c.share_class_symbol ==
+                share_class_symbol,
+                self.equities.c.start_date <= ad_value),
+        ).order_by(
+            self.equities.c.end_date.desc(),
+        ).execute().fetchall()
+        return candidates
+
+    def _get_best_candidate(self, candidates):
+        return self._retrieve_equity(candidates[0]['sid'])
+
+    def _get_equities_from_candidates(self, candidates):
+        sids = map(itemgetter('sid'), candidates)
+        results = self.retrieve_equities(sids)
+        return [results[sid] for sid in sids]
+
+    def lookup_symbol(self, symbol, as_of_date, fuzzy=False):
+        """
+        Return matching Equity of name symbol in database.
+
+        If multiple Equities are found and as_of_date is not set,
         raises MultipleSymbolsFound.
 
-        If no Asset was active at as_of_date, and allow_expired is False
-        raises SymbolNotFound.
+        If no Equity was active at as_of_date raises SymbolNotFound.
         """
-        if as_of_date is not None:
-            as_of_date = pd.Timestamp(normalize_date(as_of_date))
-
-        c = self.conn.cursor()
-
+        company_symbol, share_class_symbol, fuzzy_symbol = \
+            split_delimited_symbol(symbol)
         if as_of_date:
-            # If one SID exists for symbol, return that symbol
-            t = (symbol, as_of_date.value, as_of_date.value)
-            query = ("select sid from equities "
-                     "where symbol=? "
-                     "and start_date<=? "
-                     "and end_date>=?")
-            c.execute(query, t)
-            candidates = c.fetchall()
+            # Format inputs
+            as_of_date = pd.Timestamp(as_of_date).normalize()
+            ad_value = as_of_date.value
 
-            if len(candidates) == 1:
-                return self._retrieve_equity(candidates[0][0])
+            if fuzzy:
+                # Search for a single exact match on the fuzzy column
+                candidates = self._get_fuzzy_candidates_in_range(fuzzy_symbol,
+                                                                 ad_value)
+
+                # If exactly one SID exists for fuzzy_symbol, return that sid
+                if len(candidates) == 1:
+                    return self._get_best_candidate(candidates)
+
+            # Search for exact matches of the split-up company_symbol and
+            # share_class_symbol
+            candidates = self._get_split_candidates_in_range(
+                company_symbol,
+                share_class_symbol,
+                ad_value
+            )
+
+            # If exactly one SID exists for symbol, return that symbol
+            # If multiple SIDs exist for symbol, return latest start_date with
+            # end_date as a tie-breaker
+            if candidates:
+                return self._get_best_candidate(candidates)
 
             # If no SID exists for symbol, return SID with the
             # highest-but-not-over end_date
-            if len(candidates) == 0:
-                t = (symbol, as_of_date.value)
-                query = ("select sid from equities "
-                         "where symbol=? "
-                         "and start_date<=? "
-                         "order by end_date desc "
-                         "limit 1")
-                c.execute(query, t)
-                data = c.fetchone()
-
-                if data:
-                    return self._retrieve_equity(data[0])
-
-            # If multiple SIDs exist for symbol, return latest start_date with
-            # end_date as a tie-breaker
-            if len(candidates) > 1:
-                t = (symbol, as_of_date.value)
-                query = ("select sid from equities "
-                         "where symbol=? " +
-                         "and start_date<=? " +
-                         "order by start_date desc, end_date desc " +
-                         "limit 1")
-                c.execute(query, t)
-                data = c.fetchone()
-
-                if data:
-                    return self._retrieve_equity(data[0])
+            elif not candidates:
+                candidates = self._resolve_no_matching_candidates(
+                    company_symbol,
+                    share_class_symbol,
+                    ad_value
+                )
+                if candidates:
+                    return self._get_best_candidate(candidates)
 
             raise SymbolNotFound(symbol=symbol)
 
         else:
-            t = (symbol,)
-            query = ("select sid from equities where symbol=?")
-            c.execute(query, t)
-            data = c.fetchall()
+            # If this is a fuzzy look-up, check if there is exactly one match
+            # for the fuzzy symbol
+            if fuzzy:
+                candidates = self._get_fuzzy_candidates(fuzzy_symbol)
+                if len(candidates) == 1:
+                    return self._get_best_candidate(candidates)
 
-            if len(data) == 1:
-                return self._retrieve_equity(data[0][0])
-            elif not data:
+            candidates = self._get_split_candidates(company_symbol,
+                                                    share_class_symbol)
+            if len(candidates) == 1:
+                return self._get_best_candidate(candidates)
+            elif not candidates:
                 raise SymbolNotFound(symbol=symbol)
             else:
-                options = []
-                for row in data:
-                    sid = row[0]
-                    asset = self._retrieve_equity(sid)
-                    options.append(asset)
-                raise MultipleSymbolsFound(symbol=symbol,
-                                           options=options)
+                raise MultipleSymbolsFound(
+                    symbol=symbol,
+                    options=self._get_equities_from_candidates(candidates)
+                )
 
-    def lookup_symbol(self, symbol, as_of_date, fuzzy=False):
+    def lookup_future_symbol(self, symbol):
+        """ Return the Future object for a given symbol.
+
+        Parameters
+        ----------
+        symbol : str
+            The symbol of the desired contract.
+
+        Returns
+        -------
+        Future
+            A Future object.
+
+        Raises
+        ------
+        SymbolNotFound
+            Raised when no contract named 'symbol' is found.
+
         """
-        If a fuzzy string is provided, then we try various symbols based on
-        the provided symbol.  This is to facilitate mapping from a broker's
-        symbol to ours in cases where mapping to the broker's symbol loses
-        information. For example, if we have CMCS_A, but a broker has CMCSA,
-        when the broker provides CMCSA, it can also provide fuzzy='_',
-        so we can find a match by inserting an underscore.
-        """
-        symbol = symbol.upper()
-        as_of_date = normalize_date(as_of_date)
 
-        if not fuzzy:
-            try:
-                return self.lookup_symbol_resolve_multiple(symbol, as_of_date)
-            except SymbolNotFound:
-                return None
-        else:
-            c = self.conn.cursor()
-            fuzzy = symbol.replace(self.fuzzy_char, '')
-            t = (fuzzy, as_of_date.value, as_of_date.value)
-            query = ("select sid from equities "
-                     "where fuzzy=? " +
-                     "and start_date<=? " +
-                     "and end_date>=?")
-            c.execute(query, t)
-            candidates = c.fetchall()
+        data = self._select_asset_by_symbol(self.futures_contracts, symbol)\
+                   .execute().fetchone()
 
-            # If one SID exists for symbol, return that symbol
-            if len(candidates) == 1:
-                return self._retrieve_equity(candidates[0][0])
+        # If no data found, raise an exception
+        if not data:
+            raise SymbolNotFound(symbol=symbol)
+        return self.retrieve_asset(data['sid'])
 
-            # If multiple SIDs exist for symbol, return latest start_date with
-            # end_date as a tie-breaker
-            if len(candidates) > 1:
-                t = (symbol, as_of_date.value)
-                query = ("select sid from equities "
-                         "where symbol=? " +
-                         "and start_date<=? " +
-                         "order by start_date desc, end_date desc" +
-                         "limit 1")
-                c.execute(query, t)
-                data = c.fetchone()
-                if data:
-                    return self._retrieve_equity(data[0])
-
-    def lookup_future_chain(self, root_symbol, as_of_date, knowledge_date):
+    def lookup_future_chain(self, root_symbol, as_of_date):
         """ Return the futures chain for a given root symbol.
 
         Parameters
         ----------
         root_symbol : str
             Root symbol of the desired future.
+
         as_of_date : pd.Timestamp or pd.NaT
             Date at which the chain determination is rooted. I.e. the
-            existing contract whose notice date is first after this
-            date is the primary contract, etc. If NaT is given, the
-            chain is unbounded, and all contracts for this root symbol
-            are returned.
-        knowledge_date : pd.Timestamp or pd.NaT
-            Date for determining which contracts exist for inclusion in
-            this chain. Contracts exist only if they have a start_date
-            on or before this date. If NaT is given and as_of_date is
-            is not NaT, the value of as_of_date is used for
-            knowledge_date.
+            existing contract whose notice date/expiration date is first
+            after this date is the primary contract, etc. If NaT is
+            given, the chain is unbounded, and all contracts for this
+            root symbol are returned.
 
         Returns
         -------
@@ -468,55 +586,92 @@ class AssetFinder(object):
             Raised when a future chain could not be found for the given
             root symbol.
         """
-        c = self.conn.cursor()
+
+        fc_cols = self.futures_contracts.c
 
         if as_of_date is pd.NaT:
             # If the as_of_date is NaT, get all contracts for this
             # root symbol.
-            t = {'root_symbol': root_symbol}
-            c.execute("""
-            select sid from futures
-            where root_symbol=:root_symbol
-            order by notice_date asc
-            """, t)
+            sids = list(map(
+                itemgetter('sid'),
+                sa.select((fc_cols.sid,)).where(
+                    (fc_cols.root_symbol == root_symbol),
+                ).order_by(
+                    fc_cols.notice_date.asc(),
+                ).execute().fetchall()))
         else:
-            if knowledge_date is pd.NaT:
-                # If knowledge_date is NaT, default to using as_of_date
-                t = {'root_symbol': root_symbol,
-                     'as_of_date': as_of_date.value,
-                     'knowledge_date': as_of_date.value}
-            else:
-                t = {'root_symbol': root_symbol,
-                     'as_of_date': as_of_date.value,
-                     'knowledge_date': knowledge_date.value}
+            as_of_date = as_of_date.value
 
-            c.execute("""
-            select sid from futures
-            where root_symbol=:root_symbol
-            and :as_of_date < notice_date
-            and start_date <= :knowledge_date
-            order by notice_date asc
-            """, t)
-        sids = [r[0] for r in c.fetchall()]
+            sids = list(map(
+                itemgetter('sid'),
+                sa.select((fc_cols.sid,)).where(
+                    (fc_cols.root_symbol == root_symbol) &
+
+                    # Filter to contracts that are still valid. If both
+                    # exist, use the one that comes first in time (i.e.
+                    # the lower value). If either notice_date or
+                    # expiration_date is NaT, use the other. If both are
+                    # NaT, the contract cannot be included in any chain.
+                    sa.case(
+                        [
+                            (
+                                fc_cols.notice_date == pd.NaT.value,
+                                fc_cols.expiration_date >= as_of_date
+                            ),
+                            (
+                                fc_cols.expiration_date == pd.NaT.value,
+                                fc_cols.notice_date >= as_of_date
+                            )
+                        ],
+                        else_=(
+                            sa.func.min(
+                                fc_cols.notice_date,
+                                fc_cols.expiration_date
+                            ) >= as_of_date
+                        )
+                    )
+                ).order_by(
+                    # If both dates exist sort using minimum of
+                    # expiration_date and notice_date
+                    # else if one is NaT use the other.
+                    sa.case(
+                        [
+                            (
+                                fc_cols.expiration_date == pd.NaT.value,
+                                fc_cols.notice_date
+                            ),
+                            (
+                                fc_cols.notice_date == pd.NaT.value,
+                                fc_cols.expiration_date
+                            )
+                        ],
+                        else_=(
+                            sa.func.min(
+                                fc_cols.notice_date,
+                                fc_cols.expiration_date
+                            )
+                        )
+                    ).asc()
+                ).execute().fetchall()
+            ))
+
         if not sids:
             # Check if root symbol exists.
-            c.execute("""
-            select count(sid) from futures where root_symbol=:root_symbol
-            """, t)
-            count = c.fetchone()[0]
+            count = sa.select((sa.func.count(fc_cols.sid),)).where(
+                fc_cols.root_symbol == root_symbol,
+            ).scalar()
             if count == 0:
                 raise RootSymbolNotFound(root_symbol=root_symbol)
-            else:
-                # If symbol exists, return empty future chain.
-                return []
-        return [self._retrieve_futures_contract(sid) for sid in sids]
+
+        contracts = self.retrieve_futures_contracts(sids)
+        return [contracts[sid] for sid in sids]
 
     @property
     def sids(self):
-        c = self.conn.cursor()
-        query = 'select sid from asset_router'
-        c.execute(query)
-        return [r[0] for r in c.fetchall()]
+        return tuple(map(
+            itemgetter('sid'),
+            sa.select((self.asset_router.c.sid,)).execute().fetchall(),
+        ))
 
     def _lookup_generic_scalar(self,
                                asset_convertible,
@@ -535,7 +690,7 @@ class AssetFinder(object):
         elif isinstance(asset_convertible, Integral):
             try:
                 result = self.retrieve_asset(int(asset_convertible))
-            except SidNotFound:
+            except SidsNotFound:
                 missing.append(asset_convertible)
                 return None
             matches.append(result)
@@ -543,10 +698,7 @@ class AssetFinder(object):
         elif isinstance(asset_convertible, string_types):
             try:
                 matches.append(
-                    self.lookup_symbol_resolve_multiple(
-                        asset_convertible,
-                        as_of_date,
-                    )
+                    self.lookup_symbol(asset_convertible, as_of_date)
                 )
             except SymbolNotFound:
                 missing.append(asset_convertible)
@@ -588,7 +740,7 @@ class AssetFinder(object):
                 return matches[0], missing
             except IndexError:
                 if hasattr(asset_convertible_or_iterable, '__int__'):
-                    raise SidNotFound(sid=asset_convertible_or_iterable)
+                    raise SidsNotFound(sids=[asset_convertible_or_iterable])
                 else:
                     raise SymbolNotFound(symbol=asset_convertible_or_iterable)
 
@@ -615,14 +767,14 @@ class AssetFinder(object):
         input index.
 
         Parameters
-        __________
+        ----------
         index : Iterable
             An iterable containing ints, strings, or Assets
         as_of_date : pandas.Timestamp
             A date to be used to resolve any dual-mapped symbols
 
         Returns
-        _______
+        -------
         List
             A list of integer sids corresponding to the input index
         """
@@ -638,10 +790,6 @@ class AssetFinder(object):
         if isinstance(first_identifier, Integral):
             return index
 
-        # If symbols or Assets are provided, construction and mapping is
-        # necessary
-        self.consume_identifiers(index)
-
         # Look up all Assets for mapping
         matches = []
         missing = []
@@ -649,314 +797,47 @@ class AssetFinder(object):
             self._lookup_generic_scalar(identifier, as_of_date,
                                         matches, missing)
 
-        # Handle missing assets
-        if len(missing) > 0:
-            warnings.warn("Missing assets for identifiers: " + missing)
+        if missing:
+            raise ValueError("Missing assets for identifiers: %s" % missing)
 
         # Return a list of the sids of the found assets
         return [asset.sid for asset in matches]
 
-    def _insert_metadata(self, identifier, **kwargs):
-        """
-        Inserts the given metadata kwargs to the entry for the given
-        identifier. Matching fields in the existing entry will be overwritten.
-        :param identifier: The identifier for which to insert metadata
-        :param kwargs: The keyed metadata to insert
-        """
-        if identifier in self.metadata_cache:
-            # Multiple pass insertion no longer supported.
-            # This could and probably should raise an Exception, but is
-            # currently just a short-circuit for compatibility with existing
-            # testing structure in the test_algorithm module which creates
-            # multiple sources which all insert redundant metadata.
-            return
-
-        entry = {}
-
-        for key, value in kwargs.items():
-            # Do not accept invalid fields
-            if key not in ASSET_FIELDS:
-                continue
-            # Do not accept Nones
-            if value is None:
-                continue
-            # Do not accept empty strings
-            if value == '':
-                continue
-            # Do not accept nans from dataframes
-            if isinstance(value, float) and np.isnan(value):
-                continue
-            entry[key] = value
-
-        # Check if the sid is declared
-        try:
-            entry['sid']
-        except KeyError:
-            # If the identifier is not a sid, assign one
-            if hasattr(identifier, '__int__'):
-                entry['sid'] = identifier.__int__()
-            else:
-                if self.allow_sid_assignment:
-                    # Assign the sid the value of its insertion order.
-                    # This assumes that we are assigning values to all assets.
-                    entry['sid'] = len(self.metadata_cache)
-                else:
-                    raise SidAssignmentError(identifier=identifier)
-
-        # If the file_name is in the kwargs, it will be used as the symbol
-        try:
-            entry['symbol'] = entry.pop('file_name')
-        except KeyError:
-            pass
-
-        # If the identifier coming in was a string and there is no defined
-        # symbol yet, set the symbol to the incoming identifier
-        try:
-            entry['symbol']
-            pass
-        except KeyError:
-            if isinstance(identifier, string_types):
-                entry['symbol'] = identifier
-
-        # If the company_name is in the kwargs, it may be the asset_name
-        try:
-            company_name = entry.pop('company_name')
-            try:
-                entry['asset_name']
-            except KeyError:
-                entry['asset_name'] = company_name
-        except KeyError:
-            pass
-
-        # If dates are given as nanos, pop them
-        try:
-            entry['start_date'] = entry.pop('start_date_nano')
-        except KeyError:
-            pass
-        try:
-            entry['end_date'] = entry.pop('end_date_nano')
-        except KeyError:
-            pass
-        try:
-            entry['notice_date'] = entry.pop('notice_date_nano')
-        except KeyError:
-            pass
-        try:
-            entry['expiration_date'] = entry.pop('expiration_date_nano')
-        except KeyError:
-            pass
-
-        # Process dates to Timestamps
-        try:
-            entry['start_date'] = pd.Timestamp(entry['start_date'], tz='UTC')
-        except KeyError:
-            # Set a default start_date of the EPOCH, so that all date queries
-            # work when a start date is not provided.
-            entry['start_date'] = pd.Timestamp(0, tz='UTC')
-        try:
-            # Set a default end_date of 'now', so that all date queries
-            # work when a end date is not provided.
-            entry['end_date'] = pd.Timestamp(entry['end_date'], tz='UTC')
-        except KeyError:
-            entry['end_date'] = self.end_date_to_assign
-        try:
-            entry['notice_date'] = pd.Timestamp(entry['notice_date'],
-                                                tz='UTC')
-        except KeyError:
-            pass
-        try:
-            entry['expiration_date'] = pd.Timestamp(entry['expiration_date'],
-                                                    tz='UTC')
-        except KeyError:
-            pass
-
-        # Build an Asset of the appropriate type, default to Equity
-        asset_type = entry.pop('asset_type', 'equity')
-        if asset_type.lower() == 'equity':
-            try:
-                fuzzy = entry['symbol'].replace(self.fuzzy_char, '') \
-                    if self.fuzzy_char else None
-            except KeyError:
-                fuzzy = None
-            asset = Equity(**entry)
-            c = self.conn.cursor()
-            t = (asset.sid,
-                 asset.symbol,
-                 asset.asset_name,
-                 asset.start_date.value if asset.start_date else None,
-                 asset.end_date.value if asset.end_date else None,
-                 asset.first_traded.value if asset.first_traded else None,
-                 asset.exchange,
-                 fuzzy)
-            c.execute("""INSERT INTO equities(
-            sid,
-            symbol,
-            asset_name,
-            start_date,
-            end_date,
-            first_traded,
-            exchange,
-            fuzzy)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)""", t)
-
-            t = (asset.sid,
-                 'equity')
-            c.execute("""INSERT INTO asset_router(sid, asset_type)
-            VALUES(?, ?)""", t)
-
-        elif asset_type.lower() == 'future':
-            asset = Future(**entry)
-            c = self.conn.cursor()
-            t = (asset.sid,
-                 asset.symbol,
-                 asset.asset_name,
-                 asset.start_date.value if asset.start_date else None,
-                 asset.end_date.value if asset.end_date else None,
-                 asset.first_traded.value if asset.first_traded else None,
-                 asset.exchange,
-                 asset.root_symbol,
-                 asset.notice_date.value if asset.notice_date else None,
-                 asset.expiration_date.value
-                 if asset.expiration_date else None,
-                 asset.contract_multiplier)
-            c.execute("""INSERT INTO futures(
-            sid,
-            symbol,
-            asset_name,
-            start_date,
-            end_date,
-            first_traded,
-            exchange,
-            root_symbol,
-            notice_date,
-            expiration_date,
-            contract_multiplier)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", t)
-
-            t = (asset.sid,
-                 'future')
-            c.execute("""INSERT INTO asset_router(sid, asset_type)
-            VALUES(?, ?)""", t)
-        else:
-            raise InvalidAssetType(asset_type=asset_type)
-
-        self.metadata_cache[identifier] = entry
-
-    def consume_identifiers(self, identifiers):
-        """
-        Consumes the given identifiers in to the metadata cache of this
-        AssetFinder.
-        """
-        for identifier in identifiers:
-            # Handle case where full Assets are passed in
-            # For example, in the creation of a DataFrameSource, the source's
-            # 'sid' args may be full Assets
-            if isinstance(identifier, Asset):
-                sid = identifier.sid
-                metadata = identifier.to_dict()
-                metadata['asset_type'] = identifier.__class__.__name__
-                self.insert_metadata(identifier=sid, **metadata)
-            else:
-                self.insert_metadata(identifier)
-
-    def consume_metadata(self, metadata):
-        """
-        Consumes the provided metadata in to the metadata cache. The
-        existing values in the cache will be overwritten when there
-        is a conflict.
-        :param metadata: The metadata to be consumed
-        """
-        # Handle dicts
-        if isinstance(metadata, dict):
-            self._insert_metadata_dict(metadata)
-        # Handle DataFrames
-        elif isinstance(metadata, pd.DataFrame):
-            self._insert_metadata_dataframe(metadata)
-        # Handle readables
-        elif hasattr(metadata, 'read'):
-            self._insert_metadata_readable(metadata)
-        else:
-            raise ConsumeAssetMetaDataError(obj=metadata)
-
-    def clear_metadata(self):
-        """
-        Used for testing.
-        """
-        self.metadata_cache = {}
-
-        self.conn = sqlite3.connect(':memory:')
-        self.create_db_tables()
-
-    def insert_metadata(self, identifier, **kwargs):
-        self._insert_metadata(identifier, **kwargs)
-        self.conn.commit()
-
-    def _insert_metadata_dataframe(self, dataframe):
-        for identifier, row in dataframe.iterrows():
-            self._insert_metadata(identifier, **row)
-        self.conn.commit()
-
-    def _insert_metadata_dict(self, dict):
-        for identifier, entry in dict.items():
-            self._insert_metadata(identifier, **entry)
-        self.conn.commit()
-
-    def _insert_metadata_readable(self, readable):
-        for row in readable.read():
-            # Parse out the row of the readable object
-            metadata_dict = {}
-            for field in ASSET_FIELDS:
-                try:
-                    row_value = row[field]
-                    # Avoid passing placeholders
-                    if row_value and (row_value != 'None'):
-                        metadata_dict[field] = row[field]
-                except KeyError:
-                    continue
-                except IndexError:
-                    continue
-            # Locate the identifier, fail if not found
-            if 'sid' in metadata_dict:
-                identifier = metadata_dict['sid']
-            elif 'symbol' in metadata_dict:
-                identifier = metadata_dict['symbol']
-            else:
-                raise ConsumeAssetMetaDataError(obj=row)
-            self._insert_metadata(identifier, **metadata_dict)
-        self.conn.commit()
-
     def _compute_asset_lifetimes(self):
         """
         Compute and cache a recarry of asset lifetimes.
-
-        FUTURE OPTIMIZATION: We're looping over a big array, which means this
-        probably should be in C/Cython.
         """
-        with self.conn as transaction:
-            results = transaction.execute(
-                'SELECT sid, start_date, end_date from equities'
-            ).fetchall()
+        equities_cols = self.equities.c
+        buf = np.array(
+            tuple(
+                sa.select((
+                    equities_cols.sid,
+                    equities_cols.start_date,
+                    equities_cols.end_date,
+                )).execute(),
+            ), dtype='<f8',  # use doubles so we get NaNs
+        )
+        lifetimes = np.recarray(
+            buf=buf,
+            shape=(len(buf),),
+            dtype=[
+                ('sid', '<f8'),
+                ('start', '<f8'),
+                ('end', '<f8')
+            ],
+        )
+        start = lifetimes.start
+        end = lifetimes.end
+        start[np.isnan(start)] = 0  # convert missing starts to 0
+        end[np.isnan(end)] = np.iinfo(int).max  # convert missing end to INTMAX
+        # Cast the results back down to int.
+        return lifetimes.astype([
+            ('sid', '<i8'),
+            ('start', '<i8'),
+            ('end', '<i8'),
+        ])
 
-            lifetimes = np.recarray(
-                shape=(len(results),),
-                dtype=[('sid', 'i8'), ('start', 'i8'), ('end', 'i8')],
-            )
-
-            # TODO: This is **WAY** slower than it could be because we have to
-            # check for None everywhere.  If we represented "no start date" as
-            # 0, and "no end date" as MAX_INT in our metadata, this would be
-            # significantly faster.
-            NO_START = 0
-            NO_END = np.iinfo(int).max
-            for idx, (sid, start, end) in enumerate(results):
-                lifetimes[idx] = (
-                    sid,
-                    start if start is not None else NO_START,
-                    end if end is not None else NO_END,
-                )
-        return lifetimes
-
-    def lifetimes(self, dates):
+    def lifetimes(self, dates, include_start_date):
         """
         Compute a DataFrame representing asset lifetimes for the specified date
         range.
@@ -965,17 +846,28 @@ class AssetFinder(object):
         ----------
         dates : pd.DatetimeIndex
             The dates for which to compute lifetimes.
+        include_start_date : bool
+            Whether or not to count the asset as alive on its start_date.
+
+            This is useful in a backtesting context where `lifetimes` is being
+            used to signify "do I have data for this asset as of the morning of
+            this date?"  For many financial metrics, (e.g. daily close), data
+            isn't available for an asset until the end of the asset's first
+            day.
 
         Returns
         -------
         lifetimes : pd.DataFrame
             A frame of dtype bool with `dates` as index and an Int64Index of
             assets as columns.  The value at `lifetimes.loc[date, asset]` will
-            be True iff `asset` existed on `data`.
+            be True iff `asset` existed on `date`.  If `include_start_date` is
+            False, then lifetimes.loc[date, asset] will be false when date ==
+            asset.start_date.
 
         See Also
         --------
         numpy.putmask
+        zipline.pipeline.engine.SimplePipelineEngine._compute_root_mask
         """
         # This is a less than ideal place to do this, because if someone adds
         # assets to the finder after we've touched lifetimes we won't have
@@ -986,7 +878,12 @@ class AssetFinder(object):
         lifetimes = self._asset_lifetimes
 
         raw_dates = dates.asi8[:, None]
-        mask = (lifetimes.start <= raw_dates) & (raw_dates <= lifetimes.end)
+        if include_start_date:
+            mask = lifetimes.start <= raw_dates
+        else:
+            mask = lifetimes.start < raw_dates
+        mask &= (raw_dates <= lifetimes.end)
+
         return pd.DataFrame(mask, index=dates, columns=lifetimes.sid)
 
 
@@ -1009,3 +906,144 @@ for _type in string_types:
 
 class NotAssetConvertible(ValueError):
     pass
+
+
+class AssetFinderCachedEquities(AssetFinder):
+    """
+    An extension to AssetFinder that loads all equities from equities table
+    into memory and overrides the methods that lookup_symbol uses to look up
+    those equities.
+    """
+
+    def __init__(self, engine):
+        super(AssetFinderCachedEquities, self).__init__(engine)
+        self.fuzzy_symbol_hashed_equities = {}
+        self.company_share_class_hashed_equities = {}
+        self.hashed_equities = sa.select(self.equities.c).execute().fetchall()
+        self._load_hashed_equities()
+
+    def _load_hashed_equities(self):
+        """
+        Populates two maps - fuzzy symbol to list of equities having that
+        fuzzy symbol and company symbol/share class symbol to list of
+        equities having that combination of company symbol/share class symbol.
+        """
+        for equity in self.hashed_equities:
+            company_symbol = equity['company_symbol']
+            share_class_symbol = equity['share_class_symbol']
+            fuzzy_symbol = equity['fuzzy_symbol']
+            asset = self._convert_row_to_equity(equity)
+            self.company_share_class_hashed_equities.setdefault(
+                (company_symbol, share_class_symbol),
+                []
+            ).append(asset)
+            self.fuzzy_symbol_hashed_equities.setdefault(
+                fuzzy_symbol, []
+            ).append(asset)
+
+    def _convert_row_to_equity(self, row):
+        """
+        Converts a SQLAlchemy equity row to an Equity object.
+        """
+        return Equity(**_convert_asset_timestamp_fields(dict(row)))
+
+    def _get_fuzzy_candidates(self, fuzzy_symbol):
+        return self.fuzzy_symbol_hashed_equities.get(fuzzy_symbol, ())
+
+    def _get_fuzzy_candidates_in_range(self, fuzzy_symbol, ad_value):
+        return only_active_assets(
+            ad_value,
+            self._get_fuzzy_candidates(fuzzy_symbol),
+        )
+
+    def _get_split_candidates(self, company_symbol, share_class_symbol):
+        return self.company_share_class_hashed_equities.get(
+            (company_symbol, share_class_symbol),
+            (),
+        )
+
+    def _get_split_candidates_in_range(self,
+                                       company_symbol,
+                                       share_class_symbol,
+                                       ad_value):
+        return sorted(
+            only_active_assets(
+                ad_value,
+                self._get_split_candidates(company_symbol, share_class_symbol),
+            ),
+            key=lambda x: (x.start_date, x.end_date),
+            reverse=True,
+        )
+
+    def _resolve_no_matching_candidates(self,
+                                        company_symbol,
+                                        share_class_symbol,
+                                        ad_value):
+        equities = self._get_split_candidates(
+            company_symbol, share_class_symbol
+        )
+        partial_candidates = []
+        for equity in equities:
+            if equity.start_date.value <= ad_value:
+                partial_candidates.append(equity)
+        if partial_candidates:
+            partial_candidates = sorted(
+                partial_candidates,
+                key=lambda x: x.end_date,
+                reverse=True
+            )
+        return partial_candidates
+
+    def _get_best_candidate(self, candidates):
+        return candidates[0]
+
+    def _get_equities_from_candidates(self, candidates):
+        return candidates
+
+
+def was_active(reference_date_value, asset):
+    """
+    Whether or not `asset` was active at the time corresponding to
+    `reference_date_value`.
+
+    Parameters
+    ----------
+    reference_date_value : int
+        Date, represented as nanoseconds since EPOCH, for which we want to know
+        if `asset` was alive.  This is generally the result of accessing the
+        `value` attribute of a pandas Timestamp.
+    asset : Asset
+        The asset object to check.
+
+    Returns
+    -------
+    was_active : bool
+        Whether or not the `asset` existed at the specified time.
+    """
+    return (
+        asset.start_date.value
+        <= reference_date_value
+        <= asset.end_date.value
+    )
+
+
+def only_active_assets(reference_date_value, assets):
+    """
+    Filter an iterable of Asset objects down to just assets that were alive at
+    the time corresponding to `reference_date_value`.
+
+    Parameters
+    ----------
+    reference_date_value : int
+        Date, represented as nanoseconds since EPOCH, for which we want to know
+        if `asset` was alive.  This is generally the result of accessing the
+        `value` attribute of a pandas Timestamp.
+    assets : iterable[Asset]
+        The assets to filter.
+
+    Returns
+    -------
+    active_assets : list
+        List of the active assets from `assets` on the requested date.
+    """
+    return [a for a in assets if was_active(reference_date_value, a)]
